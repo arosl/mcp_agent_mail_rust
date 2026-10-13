@@ -35,7 +35,8 @@ use std::sync::OnceLock;
 ///
 /// Carried verbatim in every drift warning so an operator (or agent) can repair
 /// without guessing. Offline-printable; running it is the operator's next step.
-pub const AM_INSTALL_REPAIR_COMMAND: &str = "curl -LsSf https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash";
+/// Fork (FORK.md): the fork's installer, from its `herdr` branch.
+pub const AM_INSTALL_REPAIR_COMMAND: &str = "curl -LsSf https://raw.githubusercontent.com/arosl/mcp_agent_mail_rust/herdr/install.sh | bash";
 
 /// Parsed semver triple for an `am` binary. Lightweight (no `semver` dep) — we
 /// only need ordered-tuple comparison for the known-bad ranges. Mirrors

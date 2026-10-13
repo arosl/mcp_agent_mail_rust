@@ -3,13 +3,13 @@
 # mcp-agent-mail installer
 #
 # One-liner install (with cache buster):
-#   curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh?$(date +%s)" | bash
+#   curl -fsSL "https://raw.githubusercontent.com/arosl/mcp_agent_mail_rust/herdr/install.sh?$(date +%s)" | bash
 #
 # Or without cache buster:
-#   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/arosl/mcp_agent_mail_rust/herdr/install.sh | bash
 #
 # Options:
-#   --version vX.Y.Z   Install specific version (default: latest)
+#   --version vX.Y.Z   Install specific version (default: the fork release this script pins)
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
@@ -36,7 +36,7 @@ umask 022
 shopt -s lastpipe 2>/dev/null || true
 
 VERSION="${VERSION:-}"
-OWNER="${OWNER:-Dicklesworthstone}"
+OWNER="${OWNER:-arosl}"
 REPO="${REPO:-mcp_agent_mail_rust}"
 ISSUES_URL="${ISSUES_URL:-https://github.com/${OWNER}/${REPO}/issues}"
 INSTALL_SCRIPT_URL="${INSTALL_SCRIPT_URL:-https://raw.githubusercontent.com/${OWNER}/${REPO}/main/install.sh}"
@@ -66,8 +66,15 @@ MINISIGN_TRUST_MIN_VERSION='0.3.31'
 #   SHA-256: b72b704e17a786308623d43471a046c52d663ce5d5c58c512790952455bdfb78
 MINISIGN_PUBLIC_KEY='RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70'
 MINISIGN_BIN=""
+# Fork arosl/mcp_agent_mail_rust (FORK.md): the fork's releases
+# (vX.Y.Z-herdr.N) carry no minisign signature. This script pins one release
+# and the SHA-256 of that release's SHA256SUMS manifest. ACFS pins this script
+# by its own SHA-256, so that pin covers the release binaries too. Without
+# --version, this script installs the pinned release.
+FORK_PINNED_VERSION='v0.3.38-herdr.1'
+FORK_PINNED_SHA256SUMS_SHA256=''
 # "minisign" for releases >= MINISIGN_TRUST_MIN_VERSION, "sigstore" for older
-# releases. Set by establish_release_contract.
+# releases, "pinned" for the fork's releases. Set by establish_release_contract.
 RELEASE_TRUST_MODEL=""
 EXPECTED_RELEASE_VERSION=""
 ARTIFACT_URL="${ARTIFACT_URL:-}"
@@ -327,6 +334,12 @@ draw_box() {
 resolve_version() {
   verbose "resolve_version:start preset=${VERSION:-<unset>}"
   if [ -n "$VERSION" ]; then return 0; fi
+  if [ -n "$FORK_PINNED_VERSION" ]; then
+    # Fork (FORK.md): the release this script pins, not GitHub's "latest".
+    VERSION="$FORK_PINNED_VERSION"
+    verbose "resolve_version:fork_pinned tag=${VERSION}"
+    return 0
+  fi
 
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
@@ -389,6 +402,12 @@ establish_release_contract() {
 establish_release_trust_model() {
   local core="${EXPECTED_RELEASE_VERSION%%-*}"
   local maj=0 min=0 pat=0 fmaj=0 fmin=0 fpat=0
+  if [[ "$EXPECTED_RELEASE_VERSION" == *-herdr.* ]]; then
+    # Fork (FORK.md): an unsigned fork release, verified against the
+    # SHA256SUMS digest this script pins.
+    RELEASE_TRUST_MODEL="pinned"
+    return 0
+  fi
   IFS=. read -r maj min pat <<< "$core"
   IFS=. read -r fmaj fmin fpat <<< "$MINISIGN_TRUST_MIN_VERSION"
   if [ "$maj" -gt "$fmaj" ] || \
@@ -8104,10 +8123,64 @@ verify_minisign_signed_checksum() {
   verify_checksum "$archive_file" "$expected_checksum"
 }
 
+# Fork arosl/mcp_agent_mail_rust (FORK.md): the fork's releases are unsigned.
+# Fetch the release SHA256SUMS manifest, require that it is the exact manifest
+# this script pins (FORK_PINNED_SHA256SUMS_SHA256, for FORK_PINNED_VERSION
+# only), then verify the archive against the checksum it records. Fail-closed
+# at every step.
+verify_pinned_checksum_manifest() {
+  local archive_file="$1"
+  local artifact_url="$2"
+  local artifact_name="$3"
+  local sha256sums_url sha256sums_file expected_checksum
+
+  if [ "$VERSION" != "$FORK_PINNED_VERSION" ] || [ -z "$FORK_PINNED_SHA256SUMS_SHA256" ]; then
+    err "This installer pins no checksum manifest for ${VERSION}."
+    err "It installs only the fork release it pins (${FORK_PINNED_VERSION}${FORK_PINNED_SHA256SUMS_SHA256:+, manifest ${FORK_PINNED_SHA256SUMS_SHA256}})."
+    err "Release archives are not extracted without a pinned checksum manifest unless --no-verify is explicit."
+    return 1
+  fi
+
+  sha256sums_url="$(dirname "$artifact_url")/SHA256SUMS"
+  sha256sums_file="$TMP/SHA256SUMS"
+  info "Fetching checksum manifest from ${sha256sums_url}"
+  if ! download_to_file "$sha256sums_url" "$sha256sums_file" "sha256sums-download" || [ ! -s "$sha256sums_file" ]; then
+    err "Release checksum manifest not found at ${sha256sums_url}."
+    err "Release archives are not extracted without a pinned checksum manifest unless --no-verify is explicit."
+    return 1
+  fi
+  if ! verify_checksum "$sha256sums_file" "$FORK_PINNED_SHA256SUMS_SHA256"; then
+    err "The release checksum manifest is not the one this installer pins; do not install it."
+    error_support_hint
+    return 1
+  fi
+  ok "Release manifest matches the pinned digest"
+
+  expected_checksum=$(awk -v artifact="$artifact_name" '$2 == artifact || $2 == ("./" artifact) || $2 == ("*" artifact) {print $1; exit}' "$sha256sums_file")
+  if [ -z "$expected_checksum" ]; then
+    err "The pinned SHA256SUMS manifest has no entry for ${artifact_name}."
+    err "The release asset inventory is incomplete; do not install it."
+    error_support_hint
+    return 1
+  fi
+
+  verify_checksum "$archive_file" "$expected_checksum"
+}
+
 verify_release_archive() {
   local archive_file="$1"
   local artifact_url="$2"
   local artifact_name="$3"
+
+  if [ "$RELEASE_TRUST_MODEL" = "pinned" ]; then
+    verify_pinned_checksum_manifest "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    if [ -n "$CHECKSUM" ] || [ -n "$CHECKSUM_URL" ]; then
+      # An explicitly supplied checksum witness is honored in addition to,
+      # never instead of, the pinned manifest.
+      resolve_and_verify_archive_checksum "$archive_file" "$artifact_url" "$artifact_name" || return 1
+    fi
+    return 0
+  fi
 
   if [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
     # Releases >= MINISIGN_TRUST_MIN_VERSION: the SHA256 witness and the
@@ -8635,6 +8708,8 @@ print_install_plan() {
     [ -n "${URL:-}" ] && echo "  URL:        $URL"
     if [ "$NO_VERIFY" -eq 1 ]; then
       echo "  Integrity:  UNSAFE cryptographic verification bypass (--no-verify)"
+    elif [ "$RELEASE_TRUST_MODEL" = "pinned" ]; then
+      echo "  Integrity:  required SHA256 + manifest pinned by this installer before extraction"
     elif [ "$RELEASE_TRUST_MODEL" = "minisign" ]; then
       echo "  Integrity:  required SHA256 + minisign-signed manifest before extraction"
     else

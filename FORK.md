@@ -47,6 +47,22 @@ change, as upstream. Agents in herdr panes that call the daemon's tools pass
 An installed hook is a rendered copy of the template: after upgrading, run
 `am guard install` again in each clone.
 
+Installer, updates and version:
+
+| Where | Upstream | The fork |
+|---|---|---|
+| `install.sh` `OWNER` | `Dicklesworthstone` | `arosl`: it downloads the fork's releases |
+| `install.sh` `FORK_PINNED_VERSION`, `FORK_PINNED_SHA256SUMS_SHA256` (new) | | the one fork release this installer installs, and the SHA-256 of that release's `SHA256SUMS`. Without `--version` it installs the pinned release, not GitHub's "latest" |
+| `install.sh` trust model | minisign over `SHA256SUMS` (v0.3.31 and later), Sigstore before | `pinned` for `vX.Y.Z-herdr.N`: `SHA256SUMS` must have the pinned digest, then each archive must match it. Any other fork version fails closed unless `--no-verify`. Upstream versions keep upstream's models |
+| `install.sh` usage comments | upstream's one-liner | the fork's `herdr` branch installer |
+| CLI self-update (`am self-update`, `am update`) and its "update available" check | upstream's releases | the fork's releases, so an update never replaces the fork with upstream. The fork's releases carry no minisign signature, so self-update refuses them: update through the installer (ACFS: its pinned one) |
+| CLI update hints, the self-update fallback hint, core `AM_INSTALL_REPAIR_COMMAND` | upstream's installer | the fork's `herdr` branch installer |
+| `Cargo.toml` `workspace.package.version`, `Cargo.lock` | `0.3.38` | `0.3.38-herdr.1`, the fork's release version (see Releases) |
+
+Not changed, on purpose: `install.ps1` (Windows; ACFS does not use it),
+`COSIGN_IDENTITY` (used only for upstream's releases before v0.3.31), and the
+workflows (see Releases).
+
 Tests:
 
 | File | Change |
@@ -54,10 +70,44 @@ Tests:
 | `crates/mcp-agent-mail-core/src/pane_identity.rs` | the caller pane's herdr fallback, tmux first and fail-closed, and off in the HTTP daemon; a herdr pane resolves the record nhm wrote and leaves it unchanged; cleanup keeps herdr records while tmux reports live panes |
 | `crates/mcp-agent-mail-guard/tests/guard_env_tests.rs` | `guard_check_full` resolves the committer of a herdr pane, and another agent's reservation still conflicts |
 | `crates/mcp-agent-mail-guard/src/lib.rs` | the hook reads a JSON record's name; in a herdr pane its own reservation passes and another agent's blocks |
+| `crates/mcp-agent-mail-cli/src/lib.rs` | the self-update fallback hint names the fork's `herdr` installer |
 | `FORK.md` | this file |
+
+## Branches
+
+`herdr` is the fork's release line and its default branch: upstream's
+latest release tag plus the delta above. `main` mirrors upstream's `main`
+and carries none of it. Upstream releases v0.3.31 and later from its own
+release infrastructure, not from `main`, so the fork follows upstream's
+release tags: at each new upstream release, merge its tag into `herdr` and
+cut the next fork release.
+
+## Releases
+
+The fork tags `v<upstream version>-herdr.<n>` (for example
+`v0.3.38-herdr.1`) on `herdr`, after the commit that sets that version in
+`Cargo.toml` and in `install.sh`'s `FORK_PINNED_VERSION`.
+
+Only `dist.yml` is enabled on the fork; every other workflow is disabled,
+so a tag push starts no container, crates or schedule job. `dist.yml` is
+upstream's, unchanged: the tag push builds the six targets, signs them with
+the workflow's keyless Sigstore identity and stages the 30 assets in a
+draft release. Its last step then refuses to publish, because upstream's
+ACFS does not pin this fork's installer. The draft is published by hand
+after checking what that step would have checked: the tag resolves to the
+built revision, the draft holds exactly the 30 staged assets with the
+digests the run recorded, and `install.sh` equals the tag's.
+
+Then one more commit on `herdr` sets `FORK_PINNED_SHA256SUMS_SHA256` to the
+SHA-256 of the published `SHA256SUMS`. The ACFS fork pins that commit's
+`install.sh` in `checksums.yaml`, so its pin covers the binaries. The
+installer inside a release, like the one at its tag, has no digest pinned
+and refuses to install.
 
 ## Removal
 
 Drop a row when upstream resolves herdr panes itself, or keys "the caller's
 own pane" on a variable herdr sets. Drop the `read_identity_file()` row when
-upstream's hook reads JSON records.
+upstream's hook reads JSON records. When no pane-identity row is left, the
+fork ends: ACFS pins upstream's installer again, and the installer, update
+and version rows go with the fork.

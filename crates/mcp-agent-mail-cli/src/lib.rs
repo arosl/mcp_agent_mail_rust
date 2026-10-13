@@ -23097,10 +23097,12 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     l > c
 }
 
+// Fork arosl/mcp_agent_mail_rust (FORK.md): updates come from the fork's
+// releases, never upstream's, which would drop the fork's delta.
 const DEFAULT_SELF_UPDATE_API_URL: &str =
-    "https://api.github.com/repos/Dicklesworthstone/mcp_agent_mail_rust/releases/latest";
+    "https://api.github.com/repos/arosl/mcp_agent_mail_rust/releases/latest";
 const DEFAULT_SELF_UPDATE_RELEASES_BASE_URL: &str =
-    "https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases/download";
+    "https://github.com/arosl/mcp_agent_mail_rust/releases/download";
 
 fn self_update_api_url() -> String {
     std::env::var("AM_SELF_UPDATE_API_URL")
@@ -23218,7 +23220,7 @@ fn check_for_update_from_github(current: &str) -> UpdateCheckResult {
     let html_url = body
         .get("html_url")
         .and_then(|v| v.as_str())
-        .unwrap_or("https://github.com/Dicklesworthstone/mcp_agent_mail_rust/releases")
+        .unwrap_or("https://github.com/arosl/mcp_agent_mail_rust/releases")
         .to_string();
 
     let latest_version = tag.trim_start_matches('v');
@@ -23250,7 +23252,7 @@ fn handle_self_update_check_result(result: &UpdateCheckResult) -> CliResult<()> 
             ftui_runtime::ftui_println!("Update available: {current} -> {latest}");
             ftui_runtime::ftui_println!("Download: {url}");
             ftui_runtime::ftui_println!(
-                "Run: curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/main/install.sh | bash"
+                "Run: curl -fsSL https://raw.githubusercontent.com/arosl/mcp_agent_mail_rust/herdr/install.sh | bash"
             );
         }
         UpdateCheckResult::UpToDate { current } => {
@@ -24388,9 +24390,11 @@ fn handle_self_update_full(force: bool, target_version: Option<String>) -> CliRe
 /// release artifacts directly, bypassing the in-binary self-update entirely.
 fn self_update_installer_fallback_hint(version: &str) -> String {
     let normalized = version.trim_start_matches('v');
+    // Fork (FORK.md): the `herdr` branch's installer pins the checksum
+    // manifest of the fork's release; a release tag's own installer cannot.
     format!(
         "Fallback: install via the official installer (always works, including from older binaries):\n  \
-         curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/v{normalized}/install.sh | bash -s -- --version v{normalized} --verify"
+         curl -fsSL https://raw.githubusercontent.com/arosl/mcp_agent_mail_rust/herdr/install.sh | bash -s -- --version v{normalized} --verify"
     )
 }
 
@@ -94739,18 +94743,17 @@ fn update_check_cache_prefers_xdg_cache_home_over_home() {
 fn self_update_installer_fallback_hint_strips_v_prefix_and_pins_version() {
     let hint = self_update_installer_fallback_hint("v0.2.50");
     assert!(hint.contains("install.sh"));
-    assert!(hint.contains("/v0.2.50/"));
+    assert!(hint.contains("/arosl/mcp_agent_mail_rust/herdr/install.sh"));
     assert!(hint.contains("--version v0.2.50"));
     assert!(hint.contains("--verify"));
     // No double-v after stripping the prefix.
-    assert!(!hint.contains("/vv0.2.50/"));
     assert!(!hint.contains("--version vv0.2.50"));
 }
 
 #[test]
 fn self_update_installer_fallback_hint_accepts_unprefixed_version() {
     let hint = self_update_installer_fallback_hint("0.2.50");
-    assert!(hint.contains("/v0.2.50/"));
+    assert!(hint.contains("/arosl/mcp_agent_mail_rust/herdr/install.sh"));
     assert!(hint.contains("--version v0.2.50"));
 }
 
