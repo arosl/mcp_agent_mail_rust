@@ -677,7 +677,8 @@ mod dist_release_contract {
             2,
         )?;
         require_exactly(workflow, "workflow_dispatch", 1)?;
-        require_exactly(workflow, "set -euo pipefail", 19)?;
+        // Fork (FORK.md): 20 with the test job's "Free runner disk space".
+        require_exactly(workflow, "set -euo pipefail", 20)?;
         require_exactly(workflow, "assert_glibc_floor() {", 2)?;
         require_exactly(
             workflow,

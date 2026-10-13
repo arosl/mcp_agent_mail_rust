@@ -185,8 +185,19 @@ jobs:
   test:
     needs: release_contract
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Fork arosl/mcp_agent_mail_rust (FORK.md): the workspace test build
+    # outgrew a hosted runner (killed at 39 minutes, still compiling, in run
+    # 38446923873), so this job frees disk, builds tests without debug info
+    # and has more time.
+    timeout-minutes: 240
     steps:
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
@@ -241,6 +252,9 @@ jobs:
           cargo --version --verbose
 
       - name: Run tests
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
         run: cargo test --locked --workspace
 
   build:

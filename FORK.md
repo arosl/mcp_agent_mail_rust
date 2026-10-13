@@ -111,7 +111,8 @@ Workflow changes:
 | File | Change |
 |---|---|
 | `.github/workflows/dist.yml` | `workflow_dispatch` (no inputs). `release_contract` still requires a `refs/tags/vX.Y.Z[-pre]` ref that matches `Cargo.toml`, so a dispatch on a branch fails there. The `sign` and `release` jobs run on a tag ref, not only on a tag push. Before publishing, upstream checks that upstream's `main` serves this installer and that upstream's ACFS pins its hash; the fork drops that check, since the ACFS fork pins the installer after the release (above) |
-| `tests/docs_drift_ci.rs` | the dist contract matches: `workflow_dispatch` once and without inputs, the tag-ref job condition twice, no ACFS or upstream-main check; mutations that remove the tag condition or add dispatch inputs are refused |
+| `.github/workflows/dist.yml`, `test` job | a hosted runner could not build the workspace tests (run 38446923873 was killed while compiling, 39 minutes in; upstream's own `ci.yml` has failed on hosted runners since 2026-08). The job first frees runner disk (the preinstalled .NET, Android, GHC and CodeQL), builds the tests without debug info (`CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_INCREMENTAL=0`) and may run 240 minutes. It still runs `cargo test --locked --workspace` |
+| `tests/docs_drift_ci.rs` | the dist contract matches: `workflow_dispatch` once and without inputs, the tag-ref job condition twice, no ACFS or upstream-main check, 20 `set -euo pipefail`; mutations that remove the tag condition or add dispatch inputs are refused |
 
 ## Removal
 
