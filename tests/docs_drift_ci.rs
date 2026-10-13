@@ -439,7 +439,6 @@ mod dist_release_contract {
             return Err("checksum sidecar names must not be normalized".to_string());
         }
         for forbidden in [
-            "workflow_dispatch",
             "continue-on-error",
             "No install.sh found",
             "No install.ps1 found",
@@ -650,27 +649,13 @@ mod dist_release_contract {
             "draft_assets=\"$(assert_release_state_and_census true)\"",
             "Draft asset digest or state differs from local ${asset_name}",
             "Draft asset bytes differ from local ${asset_name}",
-            "resolve_acfs_public_main() {",
-            "resolve_mcp_public_main() {",
-            "https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup.git",
-            "https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git",
             "-H 'Accept: application/vnd.github.raw+json' \\",
             "Signed installer differs from install.sh at the release revision",
             "if ! cmp --silent \"$tag_installer\" publish/install.sh; then",
-            "installer_hash=\"$(sha256sum \"$tag_installer\" | awk '{print $1}')\"",
-            "mcp_agent_mail_rust/${mcp_main_revision}/install.sh?cache_bust=${mcp_main_revision}",
-            "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
-            "Public MCP Agent Mail main does not serve the signed release installer",
-            "agentic_coding_flywheel_setup/${acfs_revision}/checksums.yaml?cache_bust=${acfs_revision}",
-            "marker = \"  mcp_agent_mail:\"",
-            "ACFS checksums must contain exactly one mcp_agent_mail entry",
-            "url: \"https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/refs/heads/main/install.sh\"",
-            "sha256: \"{expected_hash}\"",
-            "ACFS public main does not bind mcp_agent_mail to this release installer",
-            "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
-            "[ \"$mcp_main_revision_after\" != \"$mcp_main_revision\" ]",
-            "ACFS public main moved during checksum verification; refusing publication",
-            "MCP Agent Mail public main moved during checksum verification; refusing publication",
+            // Fork arosl/mcp_agent_mail_rust (FORK.md): a release is
+            // dispatched on its tag, and the run binds to that tag.
+            "  push:\n    tags:\n      - 'v*'\n",
+            "  workflow_dispatch:\n\npermissions:\n  contents: read\n",
             "gh api --method PATCH \\",
             "-F draft=false)",
             "[ \"$(jq -r '.draft' <<< \"$finalized_release\")\" != false ]",
@@ -688,9 +673,10 @@ mod dist_release_contract {
 
         require_exactly(
             workflow,
-            "if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}",
+            "if: ${{ startsWith(github.ref, 'refs/tags/v') }}",
             2,
         )?;
+        require_exactly(workflow, "workflow_dispatch", 1)?;
         require_exactly(workflow, "set -euo pipefail", 19)?;
         require_exactly(workflow, "assert_glibc_floor() {", 2)?;
         require_exactly(
@@ -706,7 +692,7 @@ mod dist_release_contract {
             workflow,
             concat!(
                 "  sign:\n",
-                "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
+                "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}\n",
                 "    needs: [release_contract, lint, test, build, linux_portability]\n",
                 "    runs-on: ubuntu-latest\n",
                 "    timeout-minutes: 45\n",
@@ -720,7 +706,7 @@ mod dist_release_contract {
             workflow,
             concat!(
                 "  release:\n",
-                "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n",
+                "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}\n",
                 "    needs: [release_contract, sign]\n",
                 "    runs-on: ubuntu-latest\n",
                 "    timeout-minutes: 60\n",
@@ -811,10 +797,11 @@ mod dist_release_contract {
             require_exactly(workflow, needle, 2)?;
         }
         require_exactly(workflow, "[ \"$remote_hash\" != \"$local_hash\" ]", 4)?;
+        // Fork (FORK.md): two, without upstream's main and ACFS fetches.
         require_exactly(
             workflow,
             "curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
-            4,
+            2,
         )?;
         require_exactly(
             workflow,
@@ -823,7 +810,6 @@ mod dist_release_contract {
         )?;
         require_exactly(workflow, "GH_TOKEN: ${{ github.token }}", 3)?;
         require_exactly(workflow, "SIGSTORE_", 6)?;
-        require_exactly(workflow, "output=\"$(timeout 30 git ls-remote --refs \\", 2)?;
         require_exactly(workflow, "assert_tag_revision() {", 2)?;
         require_exactly(
             workflow,
@@ -916,10 +902,7 @@ mod dist_release_contract {
                 "- name: Verify draft bytes, finalize, and verify public census",
                 "draft_assets=\"$(assert_release_state_and_census true)\"",
                 "tag_installer=\"${RUNNER_TEMP}/tag-install-${EXPECTED_REVISION}.sh\"",
-                "mcp_main_revision=\"$(resolve_mcp_public_main)\"",
-                "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
-                "acfs_revision=\"$(resolve_acfs_public_main)\"",
-                "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
+                "if ! cmp --silent \"$tag_installer\" publish/install.sh; then",
                 "assert_tag_revision\n          finalized_release=\"$(gh api --method PATCH \\",
                 "published_assets=\"$(assert_release_state_and_census false)\"",
             ],
@@ -1364,50 +1347,17 @@ mod dist_release_contract {
                 "if ! cmp --silent \"$tag_installer\" publish/install.sh; then",
                 "if [ ! -s publish/install.sh ]; then",
             ),
+            // Fork (FORK.md): signing and publication stay bound to a tag
+            // ref, whichever event started the run.
             mutate(
                 &workflow,
-                "output=\"$(timeout 30 git ls-remote --refs \\",
-                "output=\"$(git ls-remote --refs \\",
+                "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}\n    needs: [release_contract, sign]",
+                "    if: ${{ always() }}\n    needs: [release_contract, sign]",
             ),
             mutate(
                 &workflow,
-                "mcp_agent_mail_rust/${mcp_main_revision}/install.sh?cache_bust=${mcp_main_revision}",
-                "mcp_agent_mail_rust/main/install.sh",
-            ),
-            mutate(
-                &workflow,
-                "if ! cmp --silent \"$tag_installer\" \"$main_installer\"; then",
-                "if [ ! -s \"$main_installer\" ]; then",
-            ),
-            mutate(
-                &workflow,
-                "agentic_coding_flywheel_setup/${acfs_revision}/checksums.yaml?cache_bust=${acfs_revision}",
-                "agentic_coding_flywheel_setup/main/checksums.yaml",
-            ),
-            mutate(
-                &workflow,
-                "marker = \"  mcp_agent_mail:\"",
-                "marker = \"  mcp_agent_mail_old:\"",
-            ),
-            mutate(
-                &workflow,
-                "url: \"https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/refs/heads/main/install.sh\"",
-                "url: \"https://example.invalid/install.sh\"",
-            ),
-            mutate(
-                &workflow,
-                "sha256: \"{expected_hash}\"",
-                "sha256: \"{'0' * 64}\"",
-            ),
-            mutate(
-                &workflow,
-                "[ \"$acfs_revision_after\" != \"$acfs_revision\" ]",
-                "[ -z \"$acfs_revision_after\" ]",
-            ),
-            mutate(
-                &workflow,
-                "[ \"$mcp_main_revision_after\" != \"$mcp_main_revision\" ]",
-                "[ -z \"$mcp_main_revision_after\" ]",
+                "  workflow_dispatch:\n",
+                "  workflow_dispatch:\n    inputs:\n      ref:\n        type: string\n",
             ),
             mutate(
                 &workflow,

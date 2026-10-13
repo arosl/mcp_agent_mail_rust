@@ -57,11 +57,11 @@ Installer, updates and version:
 | `install.sh` usage comments | upstream's one-liner | the fork's `herdr` branch installer |
 | CLI self-update (`am self-update`, `am update`) and its "update available" check | upstream's releases | the fork's releases, so an update never replaces the fork with upstream. The fork's releases carry no minisign signature, so self-update refuses them: update through the installer (ACFS: its pinned one) |
 | CLI update hints, the self-update fallback hint, core `AM_INSTALL_REPAIR_COMMAND` | upstream's installer | the fork's `herdr` branch installer |
-| `Cargo.toml` `workspace.package.version`, `Cargo.lock` | `0.3.38` | `0.3.38-herdr.1`, the fork's release version (see Releases) |
+| `Cargo.toml` `workspace.package.version`, `Cargo.lock` | `0.3.38` | `0.3.38-herdr.2`, the fork's release version (see Releases) |
 
-Not changed, on purpose: `install.ps1` (Windows; ACFS does not use it),
-`COSIGN_IDENTITY` (used only for upstream's releases before v0.3.31), and the
-workflows (see Releases).
+Not changed, on purpose: `install.ps1` (Windows; ACFS does not use it), and
+`COSIGN_IDENTITY` (used only for upstream's releases before v0.3.31). The
+release workflow's changes are under Releases.
 
 Tests:
 
@@ -85,24 +85,33 @@ cut the next fork release.
 ## Releases
 
 The fork tags `v<upstream version>-herdr.<n>` (for example
-`v0.3.38-herdr.1`) on `herdr`, after the commit that sets that version in
+`v0.3.38-herdr.2`) on `herdr`, after the commit that sets that version in
 `Cargo.toml` and in `install.sh`'s `FORK_PINNED_VERSION`.
 
 Only `dist.yml` is enabled on the fork; every other workflow is disabled,
-so a tag push starts no container, crates or schedule job. `dist.yml` is
-upstream's, unchanged: the tag push builds the six targets, signs them with
-the workflow's keyless Sigstore identity and stages the 30 assets in a
-draft release. Its last step then refuses to publish, because upstream's
-ACFS does not pin this fork's installer. The draft is published by hand
-after checking what that step would have checked: the tag resolves to the
-built revision, the draft holds exactly the 30 staged assets with the
-digests the run recorded, and `install.sh` equals the tag's.
+so nothing starts a container, crates or schedule job. A tag push on the
+fork starts no run at all (tried twice for `v0.3.38-herdr.1`, which has no
+release), so a release is dispatched on its tag. The tagged commit's
+`dist.yml` must have the dispatch trigger:
+
+    gh workflow run dist.yml -R arosl/mcp_agent_mail_rust --ref v0.3.38-herdr.2
+
+The run builds the six targets, signs them with the workflow's keyless
+Sigstore identity, stages the 30 assets in a draft, verifies the draft and
+publishes it as a prerelease.
 
 Then one more commit on `herdr` sets `FORK_PINNED_SHA256SUMS_SHA256` to the
 SHA-256 of the published `SHA256SUMS`. The ACFS fork pins that commit's
 `install.sh` in `checksums.yaml`, so its pin covers the binaries. The
 installer inside a release, like the one at its tag, has no digest pinned
 and refuses to install.
+
+Workflow changes:
+
+| File | Change |
+|---|---|
+| `.github/workflows/dist.yml` | `workflow_dispatch` (no inputs). `release_contract` still requires a `refs/tags/vX.Y.Z[-pre]` ref that matches `Cargo.toml`, so a dispatch on a branch fails there. The `sign` and `release` jobs run on a tag ref, not only on a tag push. Before publishing, upstream checks that upstream's `main` serves this installer and that upstream's ACFS pins its hash; the fork drops that check, since the ACFS fork pins the installer after the release (above) |
+| `tests/docs_drift_ci.rs` | the dist contract matches: `workflow_dispatch` once and without inputs, the tag-ref job condition twice, no ACFS or upstream-main check; mutations that remove the tag condition or add dispatch inputs are refused |
 
 ## Removal
 

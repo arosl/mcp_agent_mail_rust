@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Fork arosl/mcp_agent_mail_rust (FORK.md): a tag push on the fork starts
+  # no run, so a release is dispatched on its tag (gh workflow run dist.yml
+  # --ref vX.Y.Z-herdr.N). release_contract still binds the run to that tag.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -567,7 +571,7 @@ jobs:
           getconf GNU_LIBC_VERSION
 
   sign:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: [release_contract, lint, test, build, linux_portability]
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -824,7 +828,7 @@ jobs:
           compression-level: 0
 
   release:
-    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     needs: [release_contract, sign]
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -1352,54 +1356,6 @@ jobs:
             fi
           done < <(jq -r '.[] | [.id, .name, .size, .digest, .state] | @tsv' <<< "$draft_assets")
 
-          resolve_acfs_public_main() {
-            local output revision ref_name extra
-            local -a refs=()
-
-            output="$(timeout 30 git ls-remote --refs \
-              https://github.com/Dicklesworthstone/agentic_coding_flywheel_setup.git \
-              refs/heads/main)"
-            if [ -z "$output" ]; then
-              echo "Could not resolve the public ACFS main branch" >&2
-              exit 1
-            fi
-            mapfile -t refs <<< "$output"
-            if [ "${#refs[@]}" -ne 1 ]; then
-              echo "Public ACFS main branch returned an ambiguous ref census" >&2
-              exit 1
-            fi
-            read -r revision ref_name extra <<< "${refs[0]}"
-            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$ref_name" != refs/heads/main ] || [ -n "${extra:-}" ]; then
-              echo "Public ACFS main branch returned malformed ref metadata" >&2
-              exit 1
-            fi
-            printf '%s' "$revision"
-          }
-
-          resolve_mcp_public_main() {
-            local output revision ref_name extra
-            local -a refs=()
-
-            output="$(timeout 30 git ls-remote --refs \
-              https://github.com/Dicklesworthstone/mcp_agent_mail_rust.git \
-              refs/heads/main)"
-            if [ -z "$output" ]; then
-              echo "Could not resolve the public MCP Agent Mail main branch" >&2
-              exit 1
-            fi
-            mapfile -t refs <<< "$output"
-            if [ "${#refs[@]}" -ne 1 ]; then
-              echo "Public MCP Agent Mail main branch returned an ambiguous ref census" >&2
-              exit 1
-            fi
-            read -r revision ref_name extra <<< "${refs[0]}"
-            if [[ ! "$revision" =~ ^[0-9a-f]{40}$ ]] || [ "$ref_name" != refs/heads/main ] || [ -n "${extra:-}" ]; then
-              echo "Public MCP Agent Mail main branch returned malformed ref metadata" >&2
-              exit 1
-            fi
-            printf '%s' "$revision"
-          }
-
           tag_installer="${RUNNER_TEMP}/tag-install-${EXPECTED_REVISION}.sh"
           gh api \
             -H 'Accept: application/vnd.github.raw+json' \
@@ -1410,68 +1366,11 @@ jobs:
             echo "Signed installer differs from install.sh at the release revision" >&2
             exit 1
           fi
-          installer_hash="$(sha256sum "$tag_installer" | awk '{print $1}')"
-          mcp_main_revision="$(resolve_mcp_public_main)"
-          main_installer="${RUNNER_TEMP}/main-install-${mcp_main_revision}.sh"
-          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --retry 3 --retry-all-errors --output "$main_installer" \
-            "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/${mcp_main_revision}/install.sh?cache_bust=${mcp_main_revision}"
-          if ! cmp --silent "$tag_installer" "$main_installer"; then
-            echo "Public MCP Agent Mail main does not serve the signed release installer" >&2
-            exit 1
-          fi
-          acfs_revision="$(resolve_acfs_public_main)"
-          acfs_checksums="${RUNNER_TEMP}/acfs-checksums-${EXPECTED_RELEASE_ID}.yaml"
-          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --retry 3 --retry-all-errors --output "$acfs_checksums" \
-            "https://raw.githubusercontent.com/Dicklesworthstone/agentic_coding_flywheel_setup/${acfs_revision}/checksums.yaml?cache_bust=${acfs_revision}"
-          python3 - "$acfs_checksums" "$installer_hash" <<'PY'
-          import pathlib
-          import re
-          import sys
-
-          path = pathlib.Path(sys.argv[1])
-          expected_hash = sys.argv[2]
-          if re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None:
-              raise SystemExit("release installer SHA-256 is malformed")
-
-          lines = path.read_text(encoding="utf-8").splitlines()
-          marker = "  mcp_agent_mail:"
-          if lines.count(marker) != 1:
-              raise SystemExit("ACFS checksums must contain exactly one mcp_agent_mail entry")
-          start = lines.index(marker) + 1
-          end = next(
-              (
-                  index
-                  for index in range(start, len(lines))
-                  if lines[index].startswith("  ")
-                  and not lines[index].startswith("    ")
-                  and lines[index].endswith(":")
-              ),
-              len(lines),
-          )
-          entry = [line for line in lines[start:end] if line]
-          expected_entry = [
-              '    url: "https://raw.githubusercontent.com/Dicklesworthstone/mcp_agent_mail_rust/refs/heads/main/install.sh"',
-              f'    sha256: "{expected_hash}"',
-          ]
-          if entry != expected_entry:
-              raise SystemExit(
-                  "ACFS public main does not bind mcp_agent_mail to this release installer"
-              )
-          PY
-          acfs_revision_after="$(resolve_acfs_public_main)"
-          if [ "$acfs_revision_after" != "$acfs_revision" ]; then
-            echo "ACFS public main moved during checksum verification; refusing publication" >&2
-            exit 1
-          fi
-          mcp_main_revision_after="$(resolve_mcp_public_main)"
-          if [ "$mcp_main_revision_after" != "$mcp_main_revision" ]; then
-            echo "MCP Agent Mail public main moved during checksum verification; refusing publication" >&2
-            exit 1
-          fi
-          printf 'Verified MCP main %s and ACFS main %s bind mcp_agent_mail to %s\n' \
-            "$mcp_main_revision" "$acfs_revision" "$installer_hash"
+          # Fork arosl/mcp_agent_mail_rust (FORK.md): upstream refuses to
+          # publish until upstream's main serves this installer and upstream
+          # ACFS pins its hash. The fork binds the other way round: the commit
+          # after this release pins its SHA256SUMS digest in the herdr
+          # branch's install.sh, and the ACFS fork pins that install.sh.
 
           assert_tag_revision
           finalized_release="$(gh api --method PATCH \
