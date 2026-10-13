@@ -3158,7 +3158,8 @@ pub enum AgentsCommand {
         #[arg(long = "project", short = 'p')]
         project_key: String,
         /// Tmux pane identifier (composite `session:window:pane` or bare
-        /// `%N`). Resolved from the current tmux pane when omitted.
+        /// `%N`), or a herdr pane id (`w1:p2`). Resolved from the current
+        /// tmux pane, else `$HERDR_PANE_ID`, when omitted.
         #[arg(long)]
         pane: Option<String>,
         /// Output format: table, json, or toon (default: auto-detect).
@@ -40069,12 +40070,12 @@ async fn handle_agents_async(action: AgentsCommand) -> CliResult<()> {
             let fmt = output::CliOutputFormat::resolve(format, json);
             let effective_pane = match pane.as_deref().map(str::trim) {
                 Some(p) if !p.is_empty() => p.to_string(),
-                _ => mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
+                _ => mcp_agent_mail_core::get_caller_pane_id().unwrap_or_default(),
             };
             if effective_pane.is_empty() {
                 return Err(CliError::InvalidArgument(
-                    "no pane id provided and $TMUX_PANE is not set; pass --pane explicitly \
-                     or run inside a tmux session"
+                    "no pane id provided and neither $TMUX_PANE nor $HERDR_PANE_ID is set; \
+                     pass --pane explicitly or run inside a tmux or herdr pane"
                         .into(),
                 ));
             }

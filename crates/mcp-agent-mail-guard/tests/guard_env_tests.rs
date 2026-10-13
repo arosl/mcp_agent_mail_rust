@@ -359,6 +359,62 @@ fn guard_check_full_resolves_current_pane_identity_when_agent_name_is_unset() {
     );
 }
 
+/// Fork `arosl/mcp_agent_mail_rust` (FORK.md): in a herdr pane the committer is
+/// the name in the record nhm wrote for `$HERDR_PANE_ID`.
+#[test]
+fn guard_check_full_resolves_herdr_pane_identity_when_agent_name_is_unset() {
+    let _lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = EnvGuard::save(&[
+        "WORKTREES_ENABLED",
+        "AGENT_NAME",
+        "AGENT_MAIL_BYPASS",
+        "FILE_RESERVATIONS_ENFORCEMENT_ENABLED",
+        "TMUX_PANE",
+        "HERDR_PANE_ID",
+        "XDG_CONFIG_HOME",
+    ]);
+
+    let td = tempfile::TempDir::new().expect("tempdir");
+    let archive = make_archive_with_reservations(td.path());
+    let config_home = td.path().join("config");
+    let herdr_pane = "w9:p3";
+
+    unsafe {
+        std::env::set_var("WORKTREES_ENABLED", "1");
+        std::env::remove_var("AGENT_NAME");
+        std::env::remove_var("AGENT_MAIL_BYPASS");
+        std::env::remove_var("FILE_RESERVATIONS_ENFORCEMENT_ENABLED");
+        std::env::remove_var("TMUX_PANE");
+        std::env::set_var("HERDR_PANE_ID", herdr_pane);
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+    }
+
+    let identity_path =
+        mcp_agent_mail_core::canonical_identity_path(&archive.to_string_lossy(), herdr_pane);
+    std::fs::create_dir_all(identity_path.parent().expect("identity parent"))
+        .expect("create identity parent");
+    std::fs::write(
+        identity_path,
+        "{\"name\":\"MyAgent\",\"pane_id\":\"w9:p3\",\"written_at\":\"2026-10-12T04:00:00Z\"}\n",
+    )
+    .expect("write identity");
+
+    let result = guard_check_full(&archive, &archive, &["my/stuff/file.txt".to_string()])
+        .expect("guard_check_full");
+    assert!(
+        result.conflicts.is_empty(),
+        "the herdr pane's owner must not conflict with its own reservation"
+    );
+    let result = guard_check_full(&archive, &archive, &["app/api/users.py".to_string()])
+        .expect("guard_check_full");
+    assert!(
+        !result.conflicts.is_empty(),
+        "another agent's reservation must still conflict for the herdr pane's owner"
+    );
+}
+
 #[test]
 fn guard_check_full_empty_archive_no_conflicts() {
     let _lock = ENV_LOCK

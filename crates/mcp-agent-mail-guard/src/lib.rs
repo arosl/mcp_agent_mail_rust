@@ -1017,16 +1017,30 @@ def read_identity_file(path):
         if not os.path.isfile(path) or os.path.islink(path):
             return None
         with open(path, "r", encoding="utf-8") as handle:
-            name = handle.read().strip()
-        return name or None
+            content = handle.read().strip()
+        if content.startswith("{"):
+            # A structured record (core's PaneIdentityRecord, GH#252; nhm's
+            # records for herdr panes too): the name is its "name" field.
+            try:
+                record = json.loads(content)
+            except ValueError:
+                return None
+            name = record.get("name") if isinstance(record, dict) else None
+            return (name.strip() or None) if isinstance(name, str) else None
+        return content or None
     except OSError:
         return None
 
 def current_pane_ids():
-    """Return the caller's composite tmux pane id, then its bare fallback."""
+    """Return the caller's composite tmux pane id, then its bare fallback.
+
+    Outside tmux, the caller's pane is herdr's $HERDR_PANE_ID, whose
+    identity file nhm writes (fork arosl/mcp_agent_mail_rust, FORK.md).
+    """
     pane = os.environ.get("TMUX_PANE", "").strip()
     if not pane:
-        return []
+        herdr_pane = os.environ.get("HERDR_PANE_ID", "").strip()
+        return [herdr_pane] if herdr_pane else []
     pane_ids = []
     try:
         result = subprocess.run(
@@ -6329,6 +6343,161 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+    }
+
+    /// A repo whose `a.rs` is staged and reserved by `owner`, plus the guard
+    /// plugin script; returns (tempdir, repo, storage root, script).
+    fn guard_plugin_fixture_reserved_by(
+        owner: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let td = tempfile::TempDir::new().expect("tempdir");
+        let repo_dir = td.path().join("repo");
+        let storage_root = td.path().join("storage");
+        std::fs::create_dir_all(&repo_dir).expect("mkdir repo");
+        run_git(&repo_dir, &["init", "-q"]);
+        std::fs::write(repo_dir.join("a.rs"), "fn a() {}\n").expect("write file");
+        run_git(&repo_dir, &["add", "a.rs"]);
+
+        let identity = mcp_agent_mail_core::resolve_project_identity(&repo_dir.to_string_lossy());
+        let archive_root = storage_root.join("projects").join(&identity.slug);
+        let reservations_dir = archive_root.join("file_reservations");
+        std::fs::create_dir_all(&reservations_dir).expect("mkdir reservations");
+        std::fs::write(
+            archive_root.join("project.json"),
+            serde_json::json!({
+                "slug": identity.slug,
+                "human_key": repo_dir.to_string_lossy(),
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+        std::fs::write(
+            reservations_dir.join("res.json"),
+            serde_json::json!({
+                "path_pattern": "a.rs",
+                "agent_name": owner,
+                "exclusive": true,
+                "expires_ts": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+                "released_ts": serde_json::Value::Null,
+            })
+            .to_string(),
+        )
+        .expect("write reservation");
+
+        let script_path = td.path().join("guard.py");
+        std::fs::write(
+            &script_path,
+            render_guard_plugin_script(&repo_dir.to_string_lossy(), "pre-commit"),
+        )
+        .expect("write guard script");
+        (td, repo_dir, storage_root, script_path)
+    }
+
+    /// The canonical identity file of `pane` for `repo_dir`, under
+    /// `config_home`, holding `record`.
+    fn write_canonical_identity_fixture(
+        config_home: &Path,
+        repo_dir: &Path,
+        pane: &str,
+        record: &str,
+    ) {
+        let config_home = config_home.to_string_lossy().into_owned();
+        let repo_key = repo_dir.to_string_lossy().into_owned();
+        let identity_path = mcp_agent_mail_core::config::with_process_env_overrides_for_test(
+            &[("XDG_CONFIG_HOME", config_home.as_str())],
+            || mcp_agent_mail_core::canonical_identity_path(&repo_key, pane),
+        );
+        std::fs::create_dir_all(identity_path.parent().expect("identity parent"))
+            .expect("create identity parent");
+        std::fs::write(identity_path, format!("{record}\n")).expect("write identity");
+    }
+
+    /// Core writes JSON records (GH#252), and the hook must read their
+    /// `name` field rather than take the whole JSON text as the name (fork
+    /// `arosl/mcp_agent_mail_rust`, FORK.md).
+    #[test]
+    fn guard_plugin_reads_the_name_of_a_structured_pane_record() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        let (td, repo_dir, storage_root, script_path) =
+            guard_plugin_fixture_reserved_by("PaneAgent");
+        let config_home = td.path().join("config");
+        write_canonical_identity_fixture(
+            &config_home,
+            &repo_dir,
+            "%guard-json",
+            "{\"name\":\"PaneAgent\",\"written_at\":\"2026-10-12T04:00:00Z\"}",
+        );
+
+        let output = Command::new(&python)
+            .current_dir(&repo_dir)
+            .env_remove("AGENT_NAME")
+            .env_remove("AGENT_MAIL_BYPASS")
+            .env_remove("AGENT_MAIL_GUARD_MODE")
+            .env_remove("HERDR_PANE_ID")
+            .env("HOME", td.path().join("home"))
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("TMUX_PANE", "%guard-json")
+            .env("STORAGE_ROOT", &storage_root)
+            .arg(&script_path)
+            .output()
+            .expect("run guard script");
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "guard must take the record's name as the pane owner: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Fork `arosl/mcp_agent_mail_rust` (FORK.md): in a herdr pane the hook
+    /// resolves the committer from the record nhm wrote for `$HERDR_PANE_ID`,
+    /// so its own reservation passes and another agent's still blocks.
+    #[test]
+    fn guard_plugin_resolves_herdr_pane_identity_when_agent_name_is_unset() {
+        let Some(python) = python_executable() else {
+            return;
+        };
+        for (owner, expected) in [("PaneAgent", Some(0)), ("OtherAgent", Some(1))] {
+            let (td, repo_dir, storage_root, script_path) = guard_plugin_fixture_reserved_by(owner);
+            let config_home = td.path().join("config");
+            write_canonical_identity_fixture(
+                &config_home,
+                &repo_dir,
+                "w9:p3",
+                "{\"name\":\"PaneAgent\",\"pane_id\":\"w9:p3\",\"written_at\":\"2026-10-12T04:00:00Z\"}",
+            );
+
+            let output = Command::new(&python)
+                .current_dir(&repo_dir)
+                .env_remove("AGENT_NAME")
+                .env_remove("AGENT_MAIL_BYPASS")
+                .env_remove("AGENT_MAIL_GUARD_MODE")
+                .env_remove("TMUX_PANE")
+                .env("HOME", td.path().join("home"))
+                .env("XDG_CONFIG_HOME", &config_home)
+                .env("HERDR_PANE_ID", "w9:p3")
+                .env("STORAGE_ROOT", &storage_root)
+                .arg(&script_path)
+                .output()
+                .expect("run guard script");
+
+            assert_eq!(
+                output.status.code(),
+                expected,
+                "reservation held by {owner}: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 
     #[test]

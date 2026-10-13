@@ -1032,11 +1032,12 @@ pub fn identity_source_category(path: &Path) -> &'static str {
 /// Resolve the agent name for the current tmux pane.
 ///
 /// Uses [`get_composite_tmux_pane_id`] to obtain a session-unique composite
-/// key (e.g., `main:0:2`), falling back to bare `$TMUX_PANE` if unavailable.
+/// key (e.g., `main:0:2`), falling back to bare `$TMUX_PANE` if unavailable,
+/// and outside tmux to herdr's `$HERDR_PANE_ID` ([`get_caller_pane_id`]).
 /// Returns `None` if no pane identifier can be determined.
 #[must_use]
 pub fn resolve_identity_current_pane(project_key: &str) -> Option<String> {
-    let pane_id = get_composite_tmux_pane_id();
+    let pane_id = get_caller_pane_id();
     resolve_identity_for_pane(project_key, pane_id.as_deref())
 }
 
@@ -1134,7 +1135,9 @@ pub fn write_identity_with_optional_pane_on_server(
 /// records that cannot be checked because tmux is not executable here, keep
 /// the historical behavior: they are matched against tmux's live
 /// composite/bare pane keys, and left untouched when tmux is not running
-/// (to avoid accidentally removing everything).
+/// (to avoid accidentally removing everything). Records for herdr panes are
+/// never removed here: tmux cannot tell whether they are stale, and nhm
+/// removes them.
 ///
 /// Returns the list of removed file paths.
 #[must_use]
@@ -1658,7 +1661,8 @@ impl<'a> PaneBindingResolver<'a> {
 /// Legacy files, and structured records this process cannot check (tmux not
 /// executable), keep the historical rule: stale when their file name matches
 /// no live tmux pane key, and never stale while tmux reports no panes at all
-/// (so a stopped or unreachable tmux cannot wipe identities).
+/// (so a stopped or unreachable tmux cannot wipe identities). A record for a
+/// herdr pane ([`is_herdr_pane_record`]) is never stale by that rule.
 ///
 /// Conservative retention: a record whose socket is gone is purged only when
 /// tmux reports at least one live pane on this host. With no local panes at
@@ -1681,12 +1685,24 @@ fn identity_entry_is_stale(entry: &std::fs::DirEntry, live_panes: &[String]) -> 
             !socket_gone || !live_panes.is_empty()
         }
         Some(PaneBindingLiveness::Unverifiable) | None => {
-            if live_panes.is_empty() {
+            if live_panes.is_empty() || record.as_ref().is_some_and(is_herdr_pane_record) {
                 return false;
             }
             !file_name_matches_live_pane(&entry.file_name(), live_panes)
         }
     }
+}
+
+/// Whether a record names a pane that is not tmux's: its `pane_id` is not a
+/// tmux `%N` id. nhm's records for herdr panes carry herdr's id (`w1:p2`) and
+/// no tmux facts. tmux's pane list says nothing about them, so cleanup keeps
+/// them; nhm removes a herdr pane's file when it retires or moves the binding
+/// (fork `arosl/mcp_agent_mail_rust`, FORK.md).
+fn is_herdr_pane_record(record: &PaneIdentityRecord) -> bool {
+    record
+        .pane_id
+        .as_deref()
+        .is_some_and(|pane| !pane.trim().starts_with('%'))
 }
 
 /// Run tmux with `args`.
@@ -2071,6 +2087,53 @@ fn tmux_pane_env() -> Option<String> {
             Some(trimmed.to_string())
         }
     })
+}
+
+/// Set once this process serves Agent Mail over HTTP ([`mark_serving_http`]).
+static SERVING_HTTP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as the HTTP daemon.
+///
+/// Its callers are remote, so the herdr pane it was started in (an `am serve`
+/// run inside a herdr pane) must never stand in for theirs: from now on
+/// [`get_caller_pane_id`] ignores this process's `$HERDR_PANE_ID`, and an
+/// HTTP caller names its pane in the request (fork
+/// `arosl/mcp_agent_mail_rust`, FORK.md).
+pub fn mark_serving_http() {
+    SERVING_HTTP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// herdr's id for this process's pane (`$HERDR_PANE_ID`, e.g. `w1:p2`),
+/// which herdr sets in every pane it starts. `None` in the HTTP daemon.
+fn herdr_pane_env() -> Option<String> {
+    if SERVING_HTTP.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    crate::config::process_env_value("HERDR_PANE_ID").and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+/// The **caller's own** pane, as identity *resolution* keys it: the tmux pane
+/// ([`get_composite_tmux_pane_id`]), else herdr's `$HERDR_PANE_ID` (fork
+/// `arosl/mcp_agent_mail_rust`, FORK.md).
+///
+/// herdr panes' identity files are written by nhm, for every binding it
+/// makes, keyed by the herdr pane id (`w1:p2` is the file `w1-p2`). nhm is
+/// their one writer, so only lookups use this: the identity writes keep
+/// [`get_composite_tmux_pane_id`] and never write a herdr pane's file.
+///
+/// Fails closed like [`get_composite_tmux_pane_id`]: `None` when neither
+/// variable is set (the `serve-http` daemon, GH#177). The HTTP daemon never
+/// takes its own herdr pane for a caller's ([`mark_serving_http`]).
+#[must_use]
+pub fn get_caller_pane_id() -> Option<String> {
+    get_composite_tmux_pane_id().or_else(herdr_pane_env)
 }
 
 #[cfg(test)]
@@ -4748,6 +4811,163 @@ esac
             assert!(
                 kept_path.exists(),
                 "uncheckable record matching a live pane key must be kept"
+            );
+        });
+        drop(tmux);
+        drop(config);
+    }
+
+    // -- herdr panes (fork arosl/mcp_agent_mail_rust, FORK.md) ---------------
+
+    /// The record nhm writes for a herdr pane (nhm's
+    /// `internal/integrations/agentmail/identity.go`): name, herdr's pane id
+    /// and the write time, no tmux facts.
+    fn nhm_record(name: &str, herdr_pane: &str) -> String {
+        format!(
+            "{{\"name\":\"{name}\",\"pane_id\":\"{herdr_pane}\",\"written_at\":\"2026-10-12T04:00:00Z\"}}"
+        )
+    }
+
+    #[test]
+    fn caller_pane_falls_back_to_herdr_pane_env() {
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", "/definitely/not/tmux"),
+                ("TMUX_PANE", ""),
+                ("HERDR_PANE_ID", "  w1:p2  "),
+            ],
+            || {
+                assert_eq!(get_caller_pane_id().as_deref(), Some("w1:p2"));
+                // Writes keep the tmux-only pane: nhm writes herdr panes' files.
+                assert_eq!(get_composite_tmux_pane_id(), None);
+            },
+        );
+    }
+
+    #[test]
+    fn caller_pane_prefers_tmux_pane_over_herdr_pane() {
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", "/definitely/not/tmux"),
+                ("TMUX_PANE", "%7"),
+                ("HERDR_PANE_ID", "w1:p2"),
+            ],
+            || {
+                assert_eq!(get_caller_pane_id().as_deref(), Some("%7"));
+            },
+        );
+    }
+
+    /// An `am serve` started inside a herdr pane serves remote callers: its
+    /// own pane must not stand in for theirs (GH#177's rule, for herdr).
+    #[test]
+    fn http_daemon_never_takes_its_own_herdr_pane_for_a_caller() {
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", "/definitely/not/tmux"),
+                ("TMUX_PANE", ""),
+                ("HERDR_PANE_ID", "w1:p2"),
+            ],
+            || {
+                mark_serving_http();
+                let pane = get_caller_pane_id();
+                // Restore before asserting: the flag is process-wide.
+                SERVING_HTTP.store(false, std::sync::atomic::Ordering::SeqCst);
+                assert_eq!(pane, None);
+            },
+        );
+    }
+
+    #[test]
+    fn caller_pane_fails_closed_without_tmux_or_herdr_pane() {
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", "/definitely/not/tmux"),
+                ("TMUX_PANE", ""),
+                ("HERDR_PANE_ID", "   "),
+            ],
+            || {
+                assert_eq!(get_caller_pane_id(), None);
+            },
+        );
+    }
+
+    /// A herdr pane resolves the name in the record nhm wrote for it, keyed
+    /// `w1-p2`, and neither the lookup nor a current-pane write changes it.
+    #[test]
+    fn herdr_pane_resolves_the_record_nhm_wrote() {
+        let config = IsolatedConfigBaseDir::new();
+        let project = config.project_key("herdr-project");
+        let path = canonical_identity_path(&project, "w1:p2");
+        assert_eq!(
+            path.file_name().and_then(OsStr::to_str),
+            Some("w1-p2"),
+            "the file name must match nhm's pane key"
+        );
+        let record = nhm_record("IcyKnoll", "w1:p2");
+        write_record_fixture(&path, &record);
+
+        crate::config::with_process_env_overrides_for_test(
+            &[
+                ("AM_TEST_TMUX_BIN", "/definitely/not/tmux"),
+                ("TMUX_PANE", ""),
+                ("HERDR_PANE_ID", "w1:p2"),
+            ],
+            || {
+                assert_eq!(
+                    resolve_identity_current_pane(&project).as_deref(),
+                    Some("IcyKnoll")
+                );
+                assert_eq!(
+                    resolve_identity_with_optional_pane(&project, None).as_deref(),
+                    Some("IcyKnoll")
+                );
+                let (name, resolved_path, status) =
+                    resolve_identity_with_binding(&project, "w1:p2").expect("explicit herdr pane");
+                assert_eq!(name, "IcyKnoll");
+                assert_eq!(resolved_path, path);
+                assert_eq!(status, PaneBindingStatus::LegacyUnverified);
+                assert!(
+                    write_identity_current_pane(&project, "OtherName").is_none(),
+                    "a current-pane write must not target a herdr pane"
+                );
+            },
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read record"),
+            format!("{record}\n"),
+            "nhm's record must be left as nhm wrote it"
+        );
+        drop(config);
+    }
+
+    /// A running tmux server says nothing about herdr panes: cleanup keeps
+    /// nhm's records while it still purges a stale legacy tmux file.
+    #[test]
+    fn cleanup_keeps_herdr_pane_records_while_tmux_runs() {
+        let config = IsolatedConfigBaseDir::new();
+        let tmux = LiveTmuxPanesGuard::new(vec!["alpha-0-1".to_string()]);
+        let project = config.project_key("cleanup-herdr-project");
+
+        let herdr_path = canonical_identity_path(&project, "w1:p2");
+        write_record_fixture(&herdr_path, &nhm_record("IcyKnoll", "w1:p2"));
+        let stale_path = canonical_identity_path(&project, "alpha:0:7");
+        std::fs::write(&stale_path, "LegacyStale\n").expect("write legacy stale");
+
+        crate::config::with_process_env_overrides_for_test(&[("AM_TEST_TMUX_BIN", "")], || {
+            let removed = cleanup_stale_identities(&project);
+            assert!(
+                removed.contains(&stale_path),
+                "a stale legacy tmux file must still be purged: {removed:?}"
+            );
+            assert!(
+                herdr_path.exists(),
+                "a herdr pane's record must not be judged by tmux's pane list"
+            );
+            let removed_all = cleanup_all_stale_identities();
+            assert!(
+                !removed_all.contains(&herdr_path) && herdr_path.exists(),
+                "global cleanup must keep herdr pane records too: {removed_all:?}"
             );
         });
         drop(tmux);

@@ -2667,6 +2667,9 @@ pub fn prepare_http_startup(
     config: &mcp_agent_mail_core::Config,
 ) -> std::io::Result<PreparedHttpStartup> {
     config.validate_user_env_authority()?;
+    // Fork arosl/mcp_agent_mail_rust (FORK.md): this process serves remote
+    // callers, so its own herdr pane is never a caller's pane.
+    mcp_agent_mail_core::mark_serving_http();
     install_crash_marker_panic_hook(config.storage_root.clone());
     let probe_report = startup_checks::run_startup_probes(config);
     if !probe_report.is_ok() {

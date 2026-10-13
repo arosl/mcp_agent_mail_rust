@@ -3422,7 +3422,9 @@ pub async fn whois(
 /// process's `$TMUX_PANE`, which lives on this process's ambient server, so a
 /// caller socket is ignored: consulting it would ask the caller's server
 /// about a pane id that was never on it, and a colliding `%N` there would
-/// verify the wrong pane. An empty pane means the caller must supply one.
+/// verify the wrong pane. Outside tmux, THIS process's pane is herdr's
+/// `$HERDR_PANE_ID` ([`mcp_agent_mail_core::get_caller_pane_id`]). An empty
+/// pane means the caller must supply one.
 fn pane_request_target<'a>(
     pane_id: Option<&str>,
     tmux_socket_path: Option<&'a str>,
@@ -3433,7 +3435,7 @@ fn pane_request_target<'a>(
         .map_or_else(
             || {
                 (
-                    mcp_agent_mail_core::get_composite_tmux_pane_id().unwrap_or_default(),
+                    mcp_agent_mail_core::get_caller_pane_id().unwrap_or_default(),
                     mcp_agent_mail_core::TmuxServer::AMBIENT,
                 )
             },
@@ -3498,8 +3500,8 @@ pub async fn resolve_pane_identity(
     if effective_pane.is_empty() {
         return Err(legacy_tool_error(
             "MISSING_PANE_ID",
-            "No pane_id provided and $TMUX_PANE is not set. \
-             Provide pane_id explicitly or run inside a tmux session.",
+            "No pane_id provided and neither $TMUX_PANE nor $HERDR_PANE_ID is set. \
+             Provide pane_id explicitly or run inside a tmux or herdr pane.",
             true,
             json!({}),
         ));
