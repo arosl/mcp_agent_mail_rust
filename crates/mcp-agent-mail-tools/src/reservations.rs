@@ -1775,6 +1775,7 @@ pub async fn file_reservation_paths(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "reserve files")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -2304,12 +2305,19 @@ pub async fn release_file_reservations(
     let agent_name =
         mcp_agent_mail_core::models::normalize_agent_name(&agent_name).unwrap_or(agent_name);
     let config = Config::get();
+    let authorization = crate::session_identity::ActorAuthorizationSnapshot::capture(ctx)?;
     let original_paths = paths.clone();
     let original_file_reservation_ids = file_reservation_ids.clone();
 
+    // Deferred releases carry authority beyond this request's lifetime. A
+    // database outage cannot authorize a constrained actor by name alone.
     let pool = match get_db_pool() {
         Ok(pool) => pool,
         Err(error) => {
+            if !authorization.permits_unresolved_actor(None) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2324,6 +2332,10 @@ pub async fn release_file_reservations(
     let project = match resolve_project(ctx, &pool, &project_key).await {
         Ok(project) => project,
         Err(error) if mcp_error_supports_release_intent(&error) => {
+            if !authorization.permits_unresolved_actor(None) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2351,6 +2363,10 @@ pub async fn release_file_reservations(
     {
         Ok(agent) => agent,
         Err(error) if mcp_error_supports_release_intent(&error) => {
+            if !authorization.permits_unresolved_actor(Some(project_id)) {
+                return Err(error);
+            }
+            ctx.ensure_live()?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2363,6 +2379,7 @@ pub async fn release_file_reservations(
         }
         Err(error) => return Err(error),
     };
+    authorization.authorize(ctx, &agent, "release file reservations")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -2376,6 +2393,7 @@ pub async fn release_file_reservations(
         {
             asupersync::Outcome::Ok(rows) => rows,
             asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
+                ctx.ensure_live()?;
                 return queued_release_intent_response(
                     &config,
                     &project_key,
@@ -2449,6 +2467,7 @@ pub async fn release_file_reservations(
     {
         asupersync::Outcome::Ok(rows) => rows,
         asupersync::Outcome::Err(error) if db_error_supports_release_intent(&error) => {
+            ctx.ensure_live()?;
             return queued_release_intent_response(
                 &config,
                 &project_key,
@@ -2590,6 +2609,7 @@ pub async fn renew_file_reservations(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(ctx, &agent, false, "renew file reservations")?;
     let agent_id = agent.id.unwrap_or(0);
     crate::tool_util::touch_acting_agent(ctx, &pool, agent.id).await;
 
@@ -2725,6 +2745,12 @@ pub async fn force_release_file_reservation(
         &project.human_key,
     )
     .await?;
+    crate::session_identity::authorize_actor(
+        ctx,
+        &actor,
+        false,
+        "force-release file reservations",
+    )?;
 
     let mut reservations = db_outcome_to_mcp_result(
         mcp_agent_mail_db::queries::get_reservations_by_ids(
@@ -2765,7 +2791,9 @@ pub async fn force_release_file_reservation(
     }
 
     // If already released, return early
-    if let Some(released_ts) = reservation.released_ts {
+    // Only a positive released_ts means released (ACTIVE_RESERVATION_PREDICATE
+    // treats a legacy 0 as active, and the release below would act on it).
+    if let Some(released_ts) = reservation.released_ts.filter(|ts| *ts > 0) {
         let response = serde_json::json!({
             "released": 0,
             "released_at": micros_to_iso(released_ts),
@@ -3086,6 +3114,13 @@ pub async fn force_release_file_reservation(
                     &agent_name,
                     &all_recipient_names,
                     &[],
+                );
+                crate::messaging::signal_direct_recipient(
+                    &Config::get(),
+                    &project.slug,
+                    &holder_agent_name,
+                    &agent_name,
+                    &message,
                 );
                 true
             }
@@ -6790,6 +6825,300 @@ mod tests {
     }
 
     #[test]
+    fn release_outage_cannot_queue_unresolved_session_actors() {
+        for enabled in [true, false] {
+            let tmp = tempfile::tempdir().expect("release identity outage fixture");
+            let blocked_parent = tmp.path().join("database-parent-is-a-file");
+            std::fs::write(&blocked_parent, b"blocked database parent").expect("block database");
+            let unavailable_url = mcp_agent_mail_core::disk::sqlite_url_from_path(
+                &blocked_parent.join("mailbox.sqlite3"),
+            );
+            crate::test_support::with_isolated_mailbox(
+                &RESERVATION_TEST_LOCK,
+                "release-identity-outage",
+                &[
+                    ("DATABASE_URL", &unavailable_url),
+                    (
+                        "MESSAGING_SESSION_IDENTITY",
+                        if enabled { "true" } else { "false" },
+                    ),
+                ],
+                |mailbox| {
+                    let pool = DbPool::new(&mcp_agent_mail_db::DbPoolConfig {
+                        database_url: mailbox.database_url.clone(),
+                        ..mcp_agent_mail_db::DbPoolConfig::default()
+                    })
+                    .expect("independent live mailbox");
+                    run_async(|cx| async move {
+                        let project =
+                            ensure_project(&cx, &pool, "/tmp/release-identity-outage").await;
+                        let project_id = project.id.unwrap();
+                        let alice = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                        let bob = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                        let alice_lease = create_test_reservation(
+                            &cx,
+                            &pool,
+                            project_id,
+                            alice.id.unwrap(),
+                            "src/alice.rs",
+                            3600,
+                            true,
+                        )
+                        .await;
+                        let bob_lease = create_test_reservation(
+                            &cx,
+                            &pool,
+                            project_id,
+                            bob.id.unwrap(),
+                            "src/bob.rs",
+                            3600,
+                            true,
+                        )
+                        .await;
+                        let ids = [alice_lease.id.unwrap(), bob_lease.id.unwrap()];
+                        let bound = McpContext::with_state(
+                            cx.clone(),
+                            1,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        crate::session_identity::bind(
+                            &bound,
+                            project_id,
+                            alice.id.unwrap(),
+                            &alice.name,
+                        );
+                        let config = Config::get();
+                        for (agent, lease) in [(&alice, &alice_lease), (&bob, &bob_lease)] {
+                            for (paths, selected_ids) in [
+                                (None, None),
+                                (Some(vec![lease.path_pattern.clone()]), None),
+                                (None, Some(vec![lease.id.unwrap()])),
+                            ] {
+                                let result = release_file_reservations(
+                                    &bound,
+                                    project.human_key.clone(),
+                                    agent.name.clone(),
+                                    paths,
+                                    selected_ids,
+                                )
+                                .await;
+                                if enabled {
+                                    let error = result.expect_err(
+                                        "unresolved identity cannot create a release intent",
+                                    );
+                                    assert!(
+                                        mcp_error_supports_release_intent(&error),
+                                        "original DB error: {error}"
+                                    );
+                                    assert_eq!(
+                                        read_queued_release_intents(&config).unwrap(),
+                                        Vec::<QueuedReleaseIntent>::new()
+                                    );
+                                } else {
+                                    let queued: Value = serde_json::from_str(
+                                        &result.expect("default-off closeout"),
+                                    )
+                                    .unwrap();
+                                    assert_eq!(queued["queued"], true);
+                                    assert_eq!(queued["released"], 0);
+                                }
+                            }
+                        }
+                        let unbound = McpContext::with_state(
+                            cx.clone(),
+                            2,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        replay_queued_release_intents(&unbound, &pool, &config).await;
+                        let leases = queries::get_reservations_by_ids(&cx, &pool, &ids)
+                            .await
+                            .into_result()
+                            .expect("actual lease state");
+                        assert_eq!(leases.len(), 2);
+                        assert!(
+                            leases
+                                .iter()
+                                .all(|lease| lease.released_ts.is_none() == enabled)
+                        );
+                        assert_eq!(
+                            read_queued_release_intents(&config).unwrap(),
+                            Vec::<QueuedReleaseIntent>::new()
+                        );
+
+                        let cancelled = McpContext::with_state(
+                            cx.clone(),
+                            3,
+                            fastmcp_core::SessionState::new(),
+                        );
+                        cancelled.request_cancellation().cancel();
+                        release_file_reservations(
+                            &cancelled,
+                            project.human_key.clone(),
+                            bob.name.clone(),
+                            None,
+                            None,
+                        )
+                        .await
+                        .expect_err("cancelled request cannot queue");
+                        assert_eq!(
+                            read_queued_release_intents(&config).unwrap(),
+                            Vec::<QueuedReleaseIntent>::new()
+                        );
+                        let queued: Value = serde_json::from_str(
+                            &release_file_reservations(
+                                &unbound,
+                                project.human_key.clone(),
+                                bob.name.clone(),
+                                None,
+                                None,
+                            )
+                            .await
+                            .expect("unbound durable release"),
+                        )
+                        .unwrap();
+                        assert_eq!(queued["queued"], true);
+                        replay_queued_release_intents(&bound, &pool, &config).await;
+                        let leases =
+                            queries::get_reservations_by_ids(&cx, &pool, &[bob_lease.id.unwrap()])
+                                .await
+                                .into_result()
+                                .expect("replayed Bob lease");
+                        assert!(leases[0].released_ts.is_some());
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_release_write_failure_queues_and_replays_under_another_session() {
+        crate::test_support::with_isolated_mailbox(
+            &RESERVATION_TEST_LOCK,
+            "authorized-release-write-failure",
+            &[("MESSAGING_SESSION_IDENTITY", "true")],
+            |_| {
+                run_async(|cx| async move {
+                    let pool = get_db_pool().expect("live pool");
+                    let project =
+                        ensure_project(&cx, &pool, "/tmp/authorized-release-write-failure").await;
+                    let project_id = project.id.unwrap();
+                    let alice = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                    let bob = register_agent(&cx, &pool, project_id, "RedPeak").await;
+                    let alice_lease = create_test_reservation(
+                        &cx,
+                        &pool,
+                        project_id,
+                        alice.id.unwrap(),
+                        "src/alice.rs",
+                        3600,
+                        true,
+                    )
+                    .await;
+                    let bob_lease = create_test_reservation(
+                        &cx,
+                        &pool,
+                        project_id,
+                        bob.id.unwrap(),
+                        "src/bob.rs",
+                        3600,
+                        true,
+                    )
+                    .await;
+                    let alice_ctx =
+                        McpContext::with_state(cx.clone(), 1, fastmcp_core::SessionState::new());
+                    let bob_ctx =
+                        McpContext::with_state(cx.clone(), 2, fastmcp_core::SessionState::new());
+                    crate::session_identity::bind(
+                        &alice_ctx,
+                        project_id,
+                        alice.id.unwrap(),
+                        &alice.name,
+                    );
+                    crate::session_identity::bind(&bob_ctx, project_id, bob.id.unwrap(), &bob.name);
+                    let conn = pool.acquire(&cx).await.into_result().expect("connection");
+                    conn.execute_sync(
+                        "CREATE TRIGGER reject_test_release BEFORE UPDATE ON file_reservations \
+                         BEGIN SELECT RAISE(ABORT, 'lease storage unavailable in identity test'); END;",
+                        &[],
+                    ).expect("force real lease-write failure");
+                    drop(conn);
+                    let refusal = release_file_reservations(
+                        &alice_ctx,
+                        project.human_key.clone(),
+                        bob.name.clone(),
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect_err("borrowed actor cannot reach failing release");
+                    assert_eq!(
+                        crate::tool_error_code(&refusal),
+                        Some("SESSION_IDENTITY_MISMATCH")
+                    );
+                    let config = Config::get();
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        Vec::<QueuedReleaseIntent>::new()
+                    );
+                    let queued: Value = serde_json::from_str(
+                        &release_file_reservations(
+                            &bob_ctx,
+                            project.human_key.clone(),
+                            bob.name.clone(),
+                            None,
+                            Some(vec![bob_lease.id.unwrap()]),
+                        )
+                        .await
+                        .expect("authorized durable release"),
+                    )
+                    .unwrap();
+                    assert_eq!(queued["queued"], true);
+                    let intents = read_queued_release_intents(&config).unwrap();
+                    assert_eq!(intents.len(), 1);
+                    let journal =
+                        std::fs::read_to_string(queued["intent"]["path"].as_str().unwrap())
+                            .expect("durable release journal");
+                    let record: Value =
+                        serde_json::from_str(journal.lines().last().unwrap()).unwrap();
+                    assert_eq!(record["failure"]["stage"], "release_reservations");
+                    assert!(
+                        record["failure"]["error_detail"]
+                            .as_str()
+                            .unwrap()
+                            .contains("lease storage unavailable in identity test")
+                    );
+                    let conn = pool.acquire(&cx).await.into_result().expect("connection");
+                    conn.execute_sync("DROP TRIGGER reject_test_release", &[])
+                        .expect("restore release writes");
+                    drop(conn);
+                    release_file_reservations(
+                        &alice_ctx,
+                        project.human_key.clone(),
+                        alice.name,
+                        None,
+                        Some(vec![alice_lease.id.unwrap()]),
+                    )
+                    .await
+                    .expect("another session triggers accepted release replay");
+                    assert_eq!(
+                        read_queued_release_intents(&config).unwrap(),
+                        Vec::<QueuedReleaseIntent>::new()
+                    );
+                    let leases = queries::get_reservations_by_ids(
+                        &cx,
+                        &pool,
+                        &[alice_lease.id.unwrap(), bob_lease.id.unwrap()],
+                    )
+                    .await
+                    .into_result()
+                    .expect("replayed leases");
+                    assert!(leases.iter().all(|lease| lease.released_ts.is_some()));
+                });
+            },
+        );
+    }
+
+    #[test]
     fn replay_queued_release_intent_releases_once() {
         with_serialized_reservations(|| {
             run_async(|cx| async move {
@@ -7290,6 +7619,65 @@ mod tests {
                 );
                 assert_eq!(parsed["reservation"]["notified"].as_bool(), Some(false));
                 assert!(parsed["reservation"]["last_agent_activity_ts"].is_null());
+            });
+        });
+    }
+
+    #[test]
+    fn force_release_treats_a_legacy_zero_released_ts_as_active() {
+        with_serialized_reservations(|| {
+            run_async(|cx| async move {
+                let pool = get_db_pool().expect("db pool");
+                let project_key = format!("/tmp/force-release-zero-ts-{}", unique_suffix());
+                let project = ensure_project(&cx, &pool, &project_key).await;
+                let project_id = project.id.unwrap_or(0);
+                let holder = register_agent(&cx, &pool, project_id, "AmberRiver").await;
+                let actor = register_agent(&cx, &pool, project_id, "BlueLake").await;
+                let created = match queries::create_file_reservations(
+                    &cx,
+                    &pool,
+                    project_id,
+                    holder.id.unwrap_or(0),
+                    &["src/legacy-zero.rs"],
+                    3600,
+                    true,
+                    "legacy zero released_ts",
+                )
+                .await
+                {
+                    Outcome::Ok(rows) => rows,
+                    other => panic!("create_file_reservations failed: {other:?}"),
+                };
+                let reservation_id = created[0].id.unwrap_or(0);
+                // An expired lease whose released_ts is the legacy 0: still active.
+                let conn = match pool.acquire(&cx).await {
+                    Outcome::Ok(conn) => conn,
+                    Outcome::Err(err) => panic!("acquire failed: {err}"),
+                    Outcome::Cancelled(_) => panic!("acquire cancelled"),
+                    Outcome::Panicked(panic) => {
+                        panic!("acquire panicked: {}", panic.message())
+                    }
+                };
+                conn.execute_sync(
+                    "UPDATE file_reservations SET expires_ts = 1, released_ts = 0 WHERE id = ?",
+                    &[mcp_agent_mail_db::sqlmodel::Value::BigInt(reservation_id)],
+                )
+                .expect("legacy row");
+                drop(conn);
+
+                let payload = force_release_file_reservation(
+                    &McpContext::new(cx.clone(), 1),
+                    project.human_key.clone(),
+                    actor.name.clone(),
+                    reservation_id,
+                    None,
+                    Some(false),
+                )
+                .await
+                .expect("force release succeeds");
+                let parsed: Value = serde_json::from_str(&payload).expect("valid JSON");
+                assert_eq!(parsed["released"].as_i64(), Some(1), "{parsed}");
+                assert!(parsed.get("already_released").is_none(), "{parsed}");
             });
         });
     }

@@ -79,6 +79,7 @@ pub mod backup_rotation;
 mod cleanup;
 pub mod console;
 mod disk_monitor;
+mod http_sessions;
 mod integrity_guard;
 mod mail_ui;
 pub mod maintenance;
@@ -3326,6 +3327,11 @@ fn trusted_platform_snapshot_temp_alias(_candidate: &Path) -> std::io::Result<Op
 }
 
 fn preferred_snapshot_temp_dir() -> std::io::Result<PathBuf> {
+    // Startup moves staging here when $TMPDIR cannot hold a probe copy
+    // (br-txx8u); every snapshot must follow it.
+    if let Some(fallback) = mcp_agent_mail_db::pool::snapshot_temp_root_fallback() {
+        return validate_snapshot_temp_dir(&fallback, "staging fallback");
+    }
     for key in ["TMPDIR", "TEMP", "TMP"] {
         let Some(value) = mcp_agent_mail_core::config::env_value(key) else {
             continue;
@@ -6110,20 +6116,25 @@ fn dispatch_timeout_error_text(
     method: &str,
     dispatch_timeout_secs: u64,
     diagnostics: &mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot,
+    fence_holder: Option<&mcp_agent_mail_storage::ArchiveFenceHolder>,
 ) -> String {
     let dispatch = &diagnostics.blocking_dispatch;
+    let fence_holder = fence_holder.map_or_else(|| "none".to_string(), ToString::to_string);
     format!(
         "Request timed out after {dispatch_timeout_secs}s (method={method}). \
          Timeout diagnostics: stage={}; stage_exceeded_budget={}; \
          client_deadline_ms={}; p99_window_secs={}; pool_acquire_p99_ms={}; \
          database_write_p99_ms={}; archive_wbq_p99_ms={}; \
          archive_commit_queue_p99_ms={}; git_commit_p99_ms={}; \
+         archive_fence_wait_ms={}; archive_fence_holder={fence_holder}; \
          blocking_dispatch_inflight={}; blocking_dispatch_zombies={}; \
          blocking_dispatch_zombies_expired={}; \
          blocking_dispatch_timeouts_total={}. \
-         (archive stages are off the request path since ack-fast: archive \
-         lag cannot cause a tool timeout; archive_commit_queue is \
-         enqueue-to-durable queue latency, not pure git work.)",
+         (the archive write-behind queue and commit queue are off the request \
+         path since ack-fast, and archive_commit_queue is enqueue-to-durable \
+         queue latency, not pure git work; reservation artifacts are written \
+         on the request path and wait for the archive publication fence, \
+         whose oldest live wait is archive_fence_wait_ms.)",
         diagnostics.stage.as_str(),
         diagnostics.stage_exceeded_budget,
         micros_to_millis_ceil(diagnostics.client_deadline_us),
@@ -6133,6 +6144,7 @@ fn dispatch_timeout_error_text(
         micros_to_millis_ceil(diagnostics.archive_wbq_p99_us),
         micros_to_millis_ceil(diagnostics.archive_commit_queue_p99_us),
         micros_to_millis_ceil(diagnostics.git_commit_p99_us),
+        micros_to_millis_ceil(diagnostics.archive_fence_wait_us),
         dispatch.inflight,
         dispatch.zombies,
         dispatch.zombies_expired,
@@ -6144,9 +6156,15 @@ fn dispatch_timeout_error(method: &str, dispatch_timeout_secs: u64) -> McpError 
     let client_deadline_us = dispatch_timeout_secs.saturating_mul(1_000_000);
     let diagnostics =
         mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(client_deadline_us);
+    let fence_holder = mcp_agent_mail_storage::archive_publication_fence_holder();
     McpError::new(
         McpErrorCode::InternalError,
-        dispatch_timeout_error_text(method, dispatch_timeout_secs, &diagnostics),
+        dispatch_timeout_error_text(
+            method,
+            dispatch_timeout_secs,
+            &diagnostics,
+            fence_holder.as_ref(),
+        ),
     )
 }
 
@@ -11349,6 +11367,8 @@ struct HttpState {
     request_diagnostics: Arc<HttpRequestRuntimeDiagnostics>,
     /// Aggregates the failed-request WARN for repeated 401/404 probes.
     probe_rejection_log: HttpProbeRejectionLog,
+    /// Opt-in stateful MCP sessions (GH#279, `MESSAGING_SESSION_IDENTITY`).
+    http_sessions: http_sessions::HttpSessionRegistry,
     health_enrichment: Arc<Mutex<HealthEnrichmentCache>>,
     /// Schedules only on the listener's real runtime, retained by the closure.
     health_refresh_scheduler: Option<HealthEnrichmentScheduler>,
@@ -11543,6 +11563,7 @@ impl HttpState {
             ws_state_fallback,
             request_diagnostics,
             probe_rejection_log: HttpProbeRejectionLog::default(),
+            http_sessions: http_sessions::HttpSessionRegistry::default(),
             health_enrichment,
             health_refresh_scheduler: health_refresh_runtime.map(health_enrichment_scheduler),
             self_ref: std::sync::OnceLock::new(),
@@ -11765,6 +11786,25 @@ impl HttpState {
             return self.error_response(&req, 404, "Not Found");
         }
 
+        // GH#279: a Streamable HTTP client ends its MCP session with DELETE.
+        if self.config.messaging_session_identity && matches!(req.method, Http1Method::Delete) {
+            let principal = http_sessions::principal_digest(header_value(&req, "authorization"));
+            let ended = header_value(&req, http_sessions::MCP_SESSION_ID_HEADER)
+                .is_some_and(|id| self.http_sessions.terminate(id, principal));
+            if !ended {
+                return self.error_response(&req, 404, "Not Found");
+            }
+            let mut resp = Http1Response::new(204, default_reason(204), Vec::new());
+            apply_cors_headers(
+                &mut resp,
+                self.cors_origin(&req),
+                self.config.http_cors_allow_credentials,
+                &self.config.http_cors_allow_methods,
+                &self.config.http_cors_allow_headers,
+            );
+            return resp;
+        }
+
         if !matches!(req.method, Http1Method::Post) {
             return self.error_response(&req, 405, "Method Not Allowed");
         }
@@ -11809,18 +11849,56 @@ impl HttpState {
         }
 
         let json_rpc = inject_tmux_pane_header(json_rpc, &req);
-        let response = self.dispatch(json_rpc).await.map_or_else(
-            || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
-            |resp| HttpResponse::ok().with_json(&resp),
-        );
+        let (session_state, new_session_id) = self.resolve_mcp_session(&req, &json_rpc);
+        let response = self
+            .dispatch_with_session(json_rpc, session_state)
+            .await
+            .map_or_else(
+                || HttpResponse::new(fastmcp_transport::http::HttpStatus::ACCEPTED),
+                |resp| HttpResponse::ok().with_json(&resp),
+            );
 
-        to_http1_response(
+        let mut out = to_http1_response(
             response,
             self.cors_origin(&req),
             self.config.http_cors_allow_credentials,
             &self.config.http_cors_allow_methods,
             &self.config.http_cors_allow_headers,
-        )
+        );
+        if let Some(id) = new_session_id {
+            out.headers
+                .push((http_sessions::MCP_SESSION_ID_HEADER.to_string(), id));
+            out.headers.push((
+                "access-control-expose-headers".to_string(),
+                http_sessions::MCP_SESSION_ID_HEADER.to_string(),
+            ));
+        }
+        out
+    }
+
+    /// The MCP session a request belongs to (GH#279, opt-in). `initialize`
+    /// starts a session whose id is returned to the client; any other request
+    /// joins the live session named by its `Mcp-Session-Id` header, provided
+    /// it carries the same authorization the session was created under.
+    /// Otherwise the request is stateless, exactly as with the feature off.
+    fn resolve_mcp_session(
+        &self,
+        req: &Http1Request,
+        request: &JsonRpcRequest,
+    ) -> (Option<SessionState>, Option<String>) {
+        if !self.config.messaging_session_identity {
+            return (None, None);
+        }
+        let principal = http_sessions::principal_digest(header_value(req, "authorization"));
+        if request.method == "initialize" {
+            return self
+                .http_sessions
+                .create(principal)
+                .map_or((None, None), |(id, state)| (Some(state), Some(id)));
+        }
+        let state = header_value(req, http_sessions::MCP_SESSION_ID_HEADER)
+            .and_then(|id| self.http_sessions.lookup(id, principal));
+        (state, None)
     }
 
     fn emit_http_request_log(
@@ -12980,7 +13058,20 @@ to skip auth for local requests.</p>
         None
     }
 
+    /// Stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     async fn dispatch(&self, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+        self.dispatch_with_session(request, None).await
+    }
+
+    /// Dispatch one JSON-RPC request. `session` is the persistent state of the
+    /// caller's MCP session (GH#279) when it has one; otherwise each request
+    /// gets fresh, request-local state.
+    async fn dispatch_with_session(
+        &self,
+        request: JsonRpcRequest,
+        session: Option<SessionState>,
+    ) -> Option<JsonRpcResponse> {
         // Upgrade self_ref to Arc so we can move into the 'static blocking closure.
         // This keeps ALL synchronous router/DB work off the async worker threads.
         let Some(arc_self) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
@@ -12993,7 +13084,11 @@ to skip auth for local requests.</p>
             let id = request.id.clone();
             let outcome = std::thread::scope(|scope| {
                 scope
-                    .spawn(|| self.dispatch_inner(request))
+                    .spawn(|| {
+                        let cx = self.request_cx();
+                        let cancel = DispatchCancel::new();
+                        self.dispatch_inner_with_cx(request, session, &cx, &cancel)
+                    })
                     .join()
                     .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
             });
@@ -13040,7 +13135,7 @@ to skip auth for local requests.</p>
             dispatch_cx,
             DispatchCancel::new(),
             Arc::new(Mutex::new(Some(permit))),
-            move |cancel| arc_self.dispatch_inner_with_cx(request, &worker_cx, &cancel),
+            move |cancel| arc_self.dispatch_inner_with_cx(request, session, &worker_cx, &cancel),
         )
         .await;
 
@@ -13052,17 +13147,19 @@ to skip auth for local requests.</p>
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Synchronous stateless dispatch (tests drive the dispatcher directly).
+    #[cfg(test)]
     fn dispatch_inner(&self, request: JsonRpcRequest) -> Result<serde_json::Value, McpError> {
         let cx = self.request_cx();
         let cancel = DispatchCancel::new();
-        self.dispatch_inner_with_cx(request, &cx, &cancel)
+        self.dispatch_inner_with_cx(request, None, &cx, &cancel)
     }
 
     #[allow(clippy::too_many_lines)]
     fn dispatch_inner_with_cx(
         &self,
         request: JsonRpcRequest,
+        session_state: Option<SessionState>,
         cx: &Cx,
         cancel: &DispatchCancel,
     ) -> Result<serde_json::Value, McpError> {
@@ -13073,8 +13170,19 @@ to skip auth for local requests.</p>
         // fastmcp's router handlers now take a request-scoped `McpContext`
         // instead of a bare `Cx`; the budget travels inside the context
         // (handlers enforce it via `budget_error`) rather than as an
-        // explicit argument.
-        let request_ctx = McpContext::new(cx.clone(), request_id).with_budget_ceiling(budget);
+        // explicit argument. The router derives tool/resource/prompt contexts
+        // from this context, so attach the same session bag used for catalog
+        // filtering; the separate router argument does not install it. Keep
+        // stateless contexts without a bag so macros cannot bind identities
+        // to a session that does not exist.
+        let request_ctx = session_state
+            .as_ref()
+            .map_or_else(
+                || McpContext::new(cx.clone(), request_id),
+                |state| McpContext::with_state(cx.clone(), request_id, state.clone()),
+            )
+            .with_budget_ceiling(budget);
+        let session_state = session_state.unwrap_or_default();
 
         match request.method.as_str() {
             "initialize" => {
@@ -13092,7 +13200,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_tools_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_tools_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "tools/call" => {
@@ -13104,7 +13212,11 @@ to skip auth for local requests.</p>
                 {
                     // Keep alias normalization tool-specific so one cluster cannot
                     // silently rewrite another tool's documented parameters.
-                    mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    if tool_name == "reply_message" {
+                        mcp_agent_mail_tools::normalize_reply_message_arguments(arguments)?;
+                    } else {
+                        mcp_agent_mail_tools::normalize_send_message_arguments(arguments)?;
+                    }
                 }
 
                 // Extract format param before dispatch (TOON support)
@@ -13197,7 +13309,7 @@ to skip auth for local requests.</p>
                 let result = block_on(self.router.handle_tools_call(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ));
@@ -13339,7 +13451,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resources_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13349,7 +13461,7 @@ to skip auth for local requests.</p>
                 let out = self.router.handle_resource_templates_list(
                     &request_ctx,
                     params,
-                    Some(session.state()),
+                    Some(&session_state),
                 )?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
@@ -13361,7 +13473,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_resources_read(
                     &request_ctx,
                     &params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -13381,7 +13493,7 @@ to skip auth for local requests.</p>
                     parse_params_or_default(request.params)?;
                 let out =
                     self.router
-                        .handle_prompts_list(&request_ctx, params, Some(session.state()))?;
+                        .handle_prompts_list(&request_ctx, params, Some(&session_state))?;
                 serde_json::to_value(out).map_err(McpError::from)
             }
             "prompts/get" => {
@@ -13389,7 +13501,7 @@ to skip auth for local requests.</p>
                 let out = block_on(self.router.handle_prompts_get(
                     &request_ctx,
                     params,
-                    SessionState::new(),
+                    session_state,
                     None,
                     None,
                 ))?;
@@ -18687,6 +18799,24 @@ mod tests {
         }
     }
 
+    struct SessionStateProbeTool;
+
+    impl fastmcp::ToolHandler for SessionStateProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "session_state_probe".to_string(),
+                description: Some("test-only session-state presence probe".to_string()),
+                ..fastmcp::ToolHandler::definition(&NoopTool)
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, _arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            Ok(vec![Content::Text {
+                text: serde_json::json!({"has_session_state": ctx.has_session_state()}).to_string(),
+            }])
+        }
+    }
+
     /// Test tool that always fails with a legacy-coded tool error (br-315wc).
     struct FailingTool {
         code: &'static str,
@@ -19136,6 +19266,7 @@ mod tests {
             archive_wbq_p99_us: 2_000,
             archive_commit_queue_p99_us: 16_778_000,
             git_commit_p99_us: 450_000,
+            archive_fence_wait_us: 0,
             blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                 inflight: 1,
                 zombies: 0,
@@ -19145,16 +19276,64 @@ mod tests {
             },
         };
 
-        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics);
+        let text = dispatch_timeout_error_text("send_message", 30, &diagnostics, None);
         assert!(text.contains("stage=blocking_dispatch_unattributed"));
         assert!(text.contains("stage_exceeded_budget=false"));
         assert!(text.contains("pool_acquire_p99_ms=9"));
         assert!(text.contains("archive_commit_queue_p99_ms=16778"));
         assert!(text.contains("git_commit_p99_ms=450"));
+        assert!(text.contains("archive_fence_wait_ms=0; archive_fence_holder=none;"));
         assert!(text.contains("blocking_dispatch_zombies_expired=0"));
         assert!(text.contains("p99_window_secs=600"));
         assert!(text.contains("off the request path since ack-fast"));
         assert!(!text.contains("database may be under heavy contention"));
+    }
+
+    /// br-9bwnb: a reservation that timed out behind the archive publication
+    /// fence names the fence, its live wait and its holder, and the text no
+    /// longer claims that archive work cannot cause a tool timeout.
+    #[test]
+    fn dispatch_timeout_text_names_a_live_archive_fence_wait_and_its_holder() {
+        let diagnostics = mcp_agent_mail_core::metrics::TimeoutDiagnosticsSnapshot {
+            client_deadline_us: 30_000_000,
+            stage: mcp_agent_mail_core::metrics::TimeoutStage::ArchiveFence,
+            stage_exceeded_budget: false,
+            p99_window_secs: mcp_agent_mail_core::metrics::RECENT_WINDOW_SECS,
+            pool_acquire_p99_us: 3_000,
+            database_write_p99_us: 6_000,
+            archive_wbq_p99_us: 0,
+            archive_commit_queue_p99_us: 1_650_000,
+            git_commit_p99_us: 630_000,
+            archive_fence_wait_us: 29_400_000,
+            blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
+                inflight: 1,
+                zombies: 0,
+                zombies_expired: 0,
+                zombies_expired_total: 0,
+                timeouts_total: 13,
+            },
+        };
+        let holder = mcp_agent_mail_storage::ArchiveFenceHolder {
+            thread: "wbq-drain (ThreadId(7))".to_string(),
+            site: "crates/mcp-agent-mail-storage/src/lib.rs:9316:20".to_string(),
+            held_for: Duration::from_millis(29_500),
+        };
+
+        let text =
+            dispatch_timeout_error_text("file_reservation_paths", 30, &diagnostics, Some(&holder));
+        assert!(text.contains("stage=archive_publication_fence"), "{text}");
+        assert!(text.contains("archive_fence_wait_ms=29400"), "{text}");
+        assert!(
+            text.contains(
+                "archive_fence_holder=wbq-drain (ThreadId(7)) at \
+                 crates/mcp-agent-mail-storage/src/lib.rs:9316:20 for 29500 ms;"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("archive lag cannot cause a tool timeout"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -19887,11 +20066,19 @@ mod tests {
     }
 
     fn prepared_http_test_config() -> mcp_agent_mail_core::Config {
+        // Only the isolated child that run_prepared_http_test_in_child spawns
+        // calls this; its private DATABASE_URL and STORAGE_ROOT reach Config
+        // through the ordinary env parsing rather than a raw re-read (GH#340).
+        // Outside that child the env is not private: refuse instead of
+        // resolving the operator's default mailbox.
+        assert!(
+            std::env::var_os("AM_PREPARED_HTTP_STARTUP_TEST_CHILD").is_some(),
+            "prepared_http_test_config runs only inside the isolated child"
+        );
+        let isolated = mcp_agent_mail_core::Config::from_env();
         let config = mcp_agent_mail_core::Config {
-            database_url: std::env::var("DATABASE_URL").expect("isolated child database"),
-            storage_root: std::env::var_os("STORAGE_ROOT")
-                .expect("isolated child archive")
-                .into(),
+            database_url: isolated.database_url,
+            storage_root: isolated.storage_root,
             http_host: "127.0.0.1".to_string(),
             http_port: 0,
             http_bearer_token: None,
@@ -21656,7 +21843,7 @@ first body
         }
     }
 
-    fn with_serialized_tool_dispatch_env<F, T>(f: F) -> T
+    fn with_serialized_tool_dispatch_env<F, T>(overrides: &[(&str, &str)], f: F) -> T
     where
         F: FnOnce(String) -> T,
     {
@@ -21680,13 +21867,14 @@ first body
             .expect("tool dispatch project root utf-8")
             .to_string();
 
-        mcp_agent_mail_core::config::with_process_env_overrides_for_test(
-            &[
-                ("DATABASE_URL", database_url.as_str()),
-                ("STORAGE_ROOT", storage_root_str.as_str()),
-            ],
-            || f(project_key),
-        )
+        let mut env_overrides = vec![
+            ("DATABASE_URL", database_url.as_str()),
+            ("STORAGE_ROOT", storage_root_str.as_str()),
+        ];
+        env_overrides.extend_from_slice(overrides);
+        mcp_agent_mail_core::config::with_process_env_overrides_for_test(&env_overrides, || {
+            f(project_key)
+        })
     }
 
     fn with_serialized_dispatch_permits<F, T>(f: F) -> T
@@ -24473,7 +24661,7 @@ first body
 
     #[test]
     fn dispatch_request_contact_preserves_contact_parameter_names() {
-        with_serialized_tool_dispatch_env(|project_key| {
+        with_serialized_tool_dispatch_env(&[], |project_key| {
             let config = mcp_agent_mail_core::Config::from_env();
             let state = build_state(config);
 
@@ -24576,6 +24764,161 @@ first body
                 .and_then(serde_json::Value::as_array)
                 .is_some(),
             "expected tools list result"
+        );
+    }
+
+    /// GH#279: with `MESSAGING_SESSION_IDENTITY` on, `initialize` mints an
+    /// `Mcp-Session-Id`; requests that send it back share the session's agent
+    /// identity (verified without a token, even fail-closed), cannot change
+    /// another agent's contact policy, and keep the policy intact on refusal.
+    /// Stateless requests do not share bindings, and `DELETE` ends the session.
+    #[test]
+    fn opt_in_http_sessions_carry_identity_across_requests() {
+        with_serialized_tool_dispatch_env(
+            &[
+                ("MESSAGING_SESSION_IDENTITY", "true"),
+                ("MESSAGING_FAIL_CLOSED_SEND_PROFILE", "true"),
+            ],
+            |project_key| {
+                let mut state = build_state(mcp_agent_mail_core::Config::from_env());
+                Arc::get_mut(&mut state.router)
+                    .expect("test owns the router")
+                    .add_tool(SessionStateProbeTool)
+                    .expect("admit the state probe");
+                let post =
+                    |method: &str, params: serde_json::Value, id: i64, session: Option<&str>| {
+                        let headers: Vec<(&str, &str)> = session
+                            .map(|session| vec![("Mcp-Session-Id", session)])
+                            .unwrap_or_default();
+                        let mut req = make_request(Http1Method::Post, "/api", &headers);
+                        req.body =
+                            serde_json::to_vec(&JsonRpcRequest::new(method, Some(params), id))
+                                .expect("serialize json-rpc");
+                        block_on(state.handle(req))
+                    };
+                let tool =
+                    |name: &str, arguments: serde_json::Value, id: i64, session: Option<&str>| {
+                        let resp = post(
+                            "tools/call",
+                            serde_json::json!({"name": name, "arguments": arguments}),
+                            id,
+                            session,
+                        );
+                        assert_eq!(resp.status, 200, "{name}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&resp.body).expect("json-rpc body");
+                        let result = body["result"].clone();
+                        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+                        (
+                            body.get("error").is_some()
+                                || result["isError"].as_bool().unwrap_or(false),
+                            serde_json::from_str::<serde_json::Value>(text)
+                                .unwrap_or(serde_json::Value::Null),
+                        )
+                    };
+
+                let init = post(
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "session-test", "version": "1"},
+                    }),
+                    1,
+                    None,
+                );
+                assert_eq!(init.status, 200);
+                let session = response_header(&init, "mcp-session-id")
+                    .expect("initialize mints a session id")
+                    .to_string();
+
+                for (header, expected) in [
+                    (Some(session.as_str()), true),
+                    (None, false),
+                    (Some("unknown-session"), false),
+                ] {
+                    let (failed, presence) =
+                        tool("session_state_probe", serde_json::json!({}), 10, header);
+                    assert!(!failed, "{presence}");
+                    assert_eq!(presence["has_session_state"], expected);
+                }
+
+                let (failed, _) = tool(
+                    "ensure_project",
+                    serde_json::json!({"human_key": project_key}),
+                    2,
+                    Some(&session),
+                );
+                assert!(!failed);
+                let identity = serde_json::json!({
+                    "project_key": project_key,
+                    "program": "codex-cli",
+                    "model": "gpt-5",
+                    "return_registration_token": false,
+                });
+                let (failed, alice) =
+                    tool("create_agent_identity", identity.clone(), 3, Some(&session));
+                assert!(!failed, "{alice}");
+                let alice = alice["name"].as_str().expect("alice").to_string();
+                let (failed, bob) = tool("create_agent_identity", identity, 4, None);
+                assert!(!failed, "{bob}");
+                let bob = bob["name"].as_str().expect("bob").to_string();
+                let (failed, _) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "open"}),
+                    5,
+                    None,
+                );
+                assert!(!failed);
+
+                let (failed, refusal) = tool(
+                    "set_contact_policy",
+                    serde_json::json!({"project_key": project_key, "agent_name": bob, "policy": "block_all"}),
+                    6,
+                    Some(&session),
+                );
+                assert!(
+                    failed,
+                    "a bound session cannot change another agent's policy"
+                );
+                assert_eq!(refusal["error"]["type"], "SESSION_IDENTITY_MISMATCH");
+
+                let send_args = serde_json::json!({
+                    "project_key": project_key,
+                    "sender_name": alice,
+                    "to": [bob],
+                    "subject": "hello",
+                    "body_md": "sent from a session",
+                });
+                let (failed, receipt) = tool("send_message", send_args.clone(), 7, Some(&session));
+                assert!(
+                    !failed,
+                    "refused block_all must leave Bob reachable: {receipt}"
+                );
+                assert_eq!(receipt["verified_sender"], true);
+                assert_eq!(receipt["sender_verification"], "session");
+
+                let (failed, _) = tool("send_message", send_args.clone(), 8, None);
+                assert!(failed, "a stateless request has no session identity");
+
+                let mut end = make_request(
+                    Http1Method::Delete,
+                    "/api",
+                    &[("Mcp-Session-Id", session.as_str())],
+                );
+                end.body = Vec::new();
+                assert_eq!(block_on(state.handle(end)).status, 204);
+                let (failed, _) = tool("send_message", send_args, 9, Some(&session));
+                assert!(failed, "an ended session has no identity");
+                let (failed, presence) = tool(
+                    "session_state_probe",
+                    serde_json::json!({}),
+                    11,
+                    Some(&session),
+                );
+                assert!(!failed, "{presence}");
+                assert_eq!(presence["has_session_state"], false);
+            },
         );
     }
 

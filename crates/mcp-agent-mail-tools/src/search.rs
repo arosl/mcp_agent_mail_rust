@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use crate::llm;
 use crate::tool_util::{
     db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_read_db_pool,
-    legacy_tool_error, resolve_existing_project, resolve_project,
+    legacy_tool_error, resolve_existing_project,
 };
 
 const MAX_SUMMARIZE_THREAD_IDS: usize = 128;
@@ -119,9 +119,9 @@ pub struct SearchResult {
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
-    /// Omitted when empty, so it must default when read back.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub bcc: Vec<String>,
+    // No bcc: search has no viewer identity, so it cannot apply fetch_inbox's
+    // "only the sender sees BCC" rule, and must not hand BCC lists to anyone
+    // who can search the project (the Python search never returned them).
     /// Message body (Markdown). Populated only when the caller passes
     /// `include_body_md=true`; otherwise omitted from the JSON envelope so
     /// FTS5 result lists stay cheap by default.
@@ -993,7 +993,6 @@ pub async fn search_messages(
                 from: r.from_agent.unwrap_or_default(),
                 to: r.to.unwrap_or_default(),
                 cc: r.cc.unwrap_or_default(),
-                bcc: r.bcc.unwrap_or_default(),
                 body_md: if include_body_md { Some(r.body) } else { None },
                 reason_codes: r.reason_codes,
                 score_factors: r.score_factors,
@@ -1179,7 +1178,8 @@ pub async fn summarize_thread(
     let msg_limit = parse_summarize_thread_limit(per_thread_limit)?;
 
     let pool = get_read_db_pool(ctx.cx()).await?;
-    let project = resolve_project(ctx, &pool, &project_key).await?;
+    // Summarizing reads; an unknown project is NOT_FOUND, never created.
+    let project = resolve_existing_project(ctx, &pool, &project_key).await?;
     let project_id = project.id.unwrap_or(0);
 
     // Check if multi-thread mode (comma-separated)
@@ -1322,7 +1322,9 @@ pub async fn summarize_thread(
         serde_json::to_string(&response)
             .map_err(|e| McpError::new(McpErrorCode::InternalError, format!("JSON error: {e}")))
     } else {
-        // Single-thread mode
+        // Single-thread mode: per_thread_limit is documented for multi-thread
+        // mode, so its default (50) must not cut a single thread to its newest
+        // messages and under-report total_messages; an explicit value applies.
         let tid = &thread_ids[0];
         let messages = db_outcome_to_mcp_result(
             mcp_agent_mail_db::queries::list_thread_messages(
@@ -1330,7 +1332,7 @@ pub async fn summarize_thread(
                 &pool,
                 project_id,
                 tid,
-                Some(msg_limit),
+                per_thread_limit.map(|_| msg_limit),
             )
             .await,
         )?;
@@ -2071,7 +2073,6 @@ mod tests {
             from: "Alice".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
@@ -2101,7 +2102,6 @@ mod tests {
             from: "Bob".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: None,
             reason_codes: Vec::new(),
             score_factors: Vec::new(),
@@ -2133,7 +2133,6 @@ mod tests {
             from: "Alice".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: None,
             reason_codes: vec!["LexicalBm25".to_string(), "FusionWeightedBlend".to_string()],
             score_factors: vec![ScoreFactorSummary {
@@ -2164,7 +2163,6 @@ mod tests {
             from: "Carol".to_string(),
             to: vec![],
             cc: vec![],
-            bcc: vec![],
             body_md: Some("# Hello\n\nthis is the body".to_string()),
             reason_codes: Vec::new(),
             score_factors: Vec::new(),

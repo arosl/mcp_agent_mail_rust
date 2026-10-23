@@ -565,12 +565,18 @@ fn coalescer_latency_health_level(
 ///
 /// Read-only: enumerates the same recovery-debris / direct-backup / staging
 /// inventories `am doctor health` reports, through the single shared
-/// implementation in the db crate. Returns `None` (block omitted) when the
-/// mailbox path cannot be resolved (e.g. `:memory:`) or the storage root
-/// cannot be inspected — health never fails on accounting.
-fn health_check_retention_block(config: &Config) -> Option<RetentionHealthResponse> {
-    let resolved =
-        mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url).ok()?;
+/// implementation in the db crate. Only an in-memory mailbox is inapplicable.
+/// A failed inventory is unavailable evidence and must degrade readiness, not
+/// silently disappear from a green response. No accounting result authorizes
+/// recovery or deletion.
+fn health_check_retention_block(
+    config: &Config,
+) -> Result<Option<RetentionHealthResponse>, String> {
+    if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(&config.database_url) {
+        return Ok(None);
+    }
+    let resolved = mcp_agent_mail_db::pool::resolve_mailbox_sqlite_path(&config.database_url)
+        .map_err(|error| format!("resolving retention mailbox: {error}"))?;
     let database_path = Path::new(&resolved.canonical_path);
     let live_database_bytes = std::fs::metadata(database_path).map_or(0, |meta| meta.len());
     // Same policy shape as the integrity guard's observe-and-alert sweep
@@ -590,12 +596,10 @@ fn health_check_retention_block(config: &Config) -> Option<RetentionHealthRespon
         database_path,
         Some((policy, now_us)),
     )
-    .ok()?;
-    // The existing operator warn threshold: the integrity guard warns when
-    // the reclaimable debris crosses `doctor_retention_alert_bytes`.
-    let reclaimable_attention = config.doctor_retention_alert_bytes > 0
-        && stats.reclaimable_bytes >= config.doctor_retention_alert_bytes;
-    Some(RetentionHealthResponse {
+    .map_err(|error| format!("inspecting retention footprint: {error}"))?;
+    let reclaimable_attention = stats.reclaimable_attention(config.doctor_retention_alert_bytes);
+    let resident_attention = stats.resident_attention(config.doctor_retention_alert_bytes);
+    Ok(Some(RetentionHealthResponse {
         resident_bytes: stats.resident_bytes,
         resident_bytes_by_category: stats
             .resident_bytes_by_category
@@ -606,7 +610,57 @@ fn health_check_retention_block(config: &Config) -> Option<RetentionHealthRespon
         reclaimable_bytes: stats.reclaimable_bytes,
         live_database_bytes: stats.live_database_bytes,
         reclaimable_attention,
-    })
+        resident_attention,
+    }))
+}
+
+/// Retention is operational degradation, never a live-corruption verdict.
+/// Keep an explicit contributor even when the byte inventory could not run.
+fn retention_health_verdict(
+    retention: &Result<Option<RetentionHealthResponse>, String>,
+) -> HealthVerdict {
+    use mcp_agent_mail_core::HealthLevel;
+    match retention {
+        Err(error) => HealthVerdict::new(
+            HealthLevel::Yellow,
+            false,
+            format!(
+                "retention inventory unavailable: {error}; inspect mailbox paths and permissions; no clean footprint was established"
+            ),
+        ),
+        Ok(None) => HealthVerdict::new(
+            HealthLevel::Green,
+            false,
+            "in-memory mailbox has no filesystem retention footprint",
+        ),
+        Ok(Some(retention)) => {
+            let attention = retention.resident_attention || retention.reclaimable_attention;
+            let live_database = retention
+                .live_database_bytes
+                .map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string());
+            HealthVerdict::new(
+                if attention {
+                    HealthLevel::Yellow
+                } else {
+                    HealthLevel::Green
+                },
+                false,
+                format!(
+                    "resident_bytes={} live_database_bytes={} reclaimable_bytes={} resident_attention={} reclaimable_attention={}; {}",
+                    retention.resident_bytes,
+                    live_database,
+                    retention.reclaimable_bytes,
+                    retention.resident_attention,
+                    retention.reclaimable_attention,
+                    if attention {
+                        "inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk space; this is not database corruption"
+                    } else {
+                        "retention is below the configured alert thresholds, or alerts are disabled"
+                    }
+                ),
+            )
+        }
+    }
 }
 
 fn percentage_clamped(value: u64, total: u64) -> u64 {
@@ -922,7 +976,14 @@ fn compute_health_verdicts(
         Err(detail) => HealthVerdict::new(Yellow, false, detail),
     };
 
-    let integrity_check = integrity_health_verdict(integrity);
+    let integrity_check = integrity_health_verdict(
+        config,
+        integrity,
+        mcp_agent_mail_core::global_metrics()
+            .db
+            .integrity_guard_first_check_due_us
+            .load(),
+    );
 
     HealthVerdicts {
         transport_health,
@@ -941,7 +1002,11 @@ fn compute_health_verdicts(
 /// outcome remains red until another complete `PRAGMA integrity_check` passes.
 /// Conversely, before a full check has completed, health is deliberately
 /// yellow rather than falsely green about evidence it does not have.
-fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> HealthVerdict {
+fn integrity_health_verdict(
+    config: &Config,
+    metrics: &mcp_agent_mail_db::IntegrityMetrics,
+    first_check_due_us: u64,
+) -> HealthVerdict {
     use mcp_agent_mail_core::HealthLevel::{Green, Red, Yellow};
     use mcp_agent_mail_db::IntegrityCheckOutcome::{Failed, Passed, Unknown};
 
@@ -954,26 +1019,68 @@ fn integrity_health_verdict(metrics: &mcp_agent_mail_db::IntegrityMetrics) -> He
                 metrics.last_full_check_ts
             ),
         ),
-        Unknown => HealthVerdict::new(
-            Yellow,
-            true,
-            "no full PRAGMA integrity_check has completed in this process",
-        ),
-        Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
+        Unknown | Passed if metrics.last_check_outcome == Failed => HealthVerdict::new(
             Red,
             true,
             format!(
-                "latest {} failed at {} after the last successful full integrity_check",
+                "latest {} failed at {}; full integrity_check evidence is required",
                 metrics
                     .last_check_kind
                     .map_or_else(|| "integrity probe".to_string(), |kind| kind.to_string()),
                 metrics.last_check_ts
             ),
         ),
+        Unknown | Passed if !config.integrity_guard_enabled => HealthVerdict::new(
+            Yellow,
+            true,
+            "periodic integrity checks, automatic backups and database maintenance disabled by configuration (INTEGRITY_GUARD_ENABLED=false)",
+        ),
+        Unknown => {
+            let detail = if mcp_agent_mail_core::disk::is_sqlite_memory_database_url(
+                &config.database_url,
+            ) {
+                "no full PRAGMA integrity_check has completed; the periodic guard does not run for an in-memory DATABASE_URL".to_string()
+            } else if config.integrity_check_interval_hours == 0 {
+                "no full PRAGMA integrity_check has completed; periodic full checking disabled by configuration (INTEGRITY_CHECK_INTERVAL_HOURS=0); quick checks remain enabled".to_string()
+            } else {
+                let startup = if config.integrity_check_on_startup {
+                    "no full PRAGMA integrity_check has completed in this process"
+                } else {
+                    "startup integrity check skipped by configuration (INTEGRITY_CHECK_ON_STARTUP=false)"
+                };
+                if first_check_due_us == 0 {
+                    format!(
+                        "{startup}; first periodic check has not been scheduled by a running integrity guard"
+                    )
+                } else {
+                    let due = i64::try_from(first_check_due_us).unwrap_or(i64::MAX);
+                    let when = mcp_agent_mail_db::micros_to_iso(due);
+                    let pending = if due <= mcp_agent_mail_db::now_micros() {
+                        "; awaiting the first successful full result"
+                    } else {
+                        ""
+                    };
+                    format!("{startup}; first periodic check due at {when}{pending}")
+                }
+            };
+            HealthVerdict::new(Yellow, true, detail)
+        }
         Passed if metrics.last_check_outcome == Unknown => HealthVerdict::new(
             Yellow,
             true,
             "full integrity_check evidence changed while the current probe outcome was unavailable",
+        ),
+        // GH#291: the full check is accepted, but the mailbox carries pages
+        // nothing references and nothing ever wrote. Advisory, not critical.
+        Passed if metrics.never_written_orphan_pages > 0 => HealthVerdict::new(
+            Yellow,
+            false,
+            format!(
+                "full integrity_check passed at {}; {} never-written orphan page(s) are leaked \
+                 space, not data damage (each is proven zero-filled and unreferenced); a \
+                 VACUUM-class rewrite reclaims them",
+                metrics.last_full_check_ts, metrics.never_written_orphan_pages
+            ),
         ),
         Passed => HealthVerdict::new(
             Green,
@@ -1390,8 +1497,8 @@ pub struct HealthCheckResponse {
     pub queues: Option<QueuesHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk: Option<DiskHealthResponse>,
-    /// Retention/reclaim resident footprint (GH#210). Omitted only when the
-    /// mailbox path cannot be resolved or inspected.
+    /// Retention/reclaim resident footprint (GH#210). An inapplicable or
+    /// unavailable block is explained by the retention health contributor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retention: Option<RetentionHealthResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1536,13 +1643,15 @@ pub struct DiskHealthResponse {
 /// ([`mcp_agent_mail_db::recovery_retention::retention_resident_stats`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionHealthResponse {
-    /// Total resident bytes: recovery debris + de-duplicated direct backups
-    /// + move-only reclaim staging.
+    /// Total resident logical bytes: recovery debris + de-duplicated direct
+    /// backups + move-only reclaim staging + parent-wide proactive stages.
     pub resident_bytes: u64,
     /// Resident bytes per category label (only nonzero categories present):
     /// `forensic_bundle`, `corrupt_quarantine`, `archive_reconcile_backup`,
     /// `sidecar_snapshot`, `stale_artifact`, `direct_backup`,
-    /// `reclaimable_staging`.
+    /// `reclaimable_staging`, `proactive_backup_staging`. Proactive stages may
+    /// belong to another mailbox sharing the database parent; this is a disk
+    /// footprint, not proof of ownership or permission to reclaim them.
     pub resident_bytes_by_category: std::collections::BTreeMap<String, u64>,
     /// Bytes already consolidated into `doctor/reclaimable/` awaiting an
     /// explicit operator removal.
@@ -1555,6 +1664,11 @@ pub struct RetentionHealthResponse {
     /// (`doctor_retention_alert_bytes`) — the same threshold the integrity
     /// guard's observe-and-alert sweep warns on. Next step: `am doctor reclaim`.
     pub reclaimable_attention: bool,
+    /// Resident evidence exceeds both the absolute floor and 20x live DB
+    /// size (absolute floor only when live size is unknown). This includes
+    /// protected backups and stage copies; it is not reclamation authority.
+    #[serde(default)]
+    pub resident_attention: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2094,6 +2208,12 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
     let descriptor_level =
         descriptor_health_level(descriptors.utilization_pct, descriptor_growth.is_some());
     effective_level = effective_level.max(descriptor_level);
+    // Observe retention once: the payload and roll-up must use the same
+    // inventory. Missing evidence or excessive retained bytes is yellow,
+    // never a reason to clear a stronger verdict or trip the DB breaker.
+    let retention = health_check_retention_block(config);
+    let retention_verdict = retention_health_verdict(&retention);
+    effective_level = effective_level.max(retention_verdict.level());
     let failing_verdicts = verdicts.failing_names();
     // GH#300: name every input behind the effective level so a red or yellow
     // top level that no decomposed verdict explains (live pressure, archive
@@ -2154,6 +2274,11 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             name: "descriptors".to_string(),
             level: descriptor_level.to_string(),
             detail: descriptor_health_detail(&descriptors, descriptor_growth.as_ref()),
+        },
+        HealthLevelContributor {
+            name: "retention".to_string(),
+            level: retention_verdict.status,
+            detail: retention_verdict.detail,
         },
     ];
     if recovery.as_ref().is_some_and(|r| r.executable_deleted) {
@@ -2306,7 +2431,7 @@ pub fn health_check(_ctx: &McpContext) -> McpResult<String> {
             fatal_threshold_mb: config.disk_space_fatal_mb,
             errors: s.errors.clone(),
         }),
-        retention: health_check_retention_block(config),
+        retention: retention.ok().flatten(),
         integrity: Some(IntegrityHealthResponse {
             last_ok_ts: integrity_metrics.last_ok_ts,
             last_check_ts: integrity_metrics.last_check_ts,
@@ -2461,6 +2586,52 @@ pub async fn register_agent(
     tmux_socket_path: Option<String>,
     registration_proof: Option<String>,
 ) -> McpResult<String> {
+    register_agent_with_token_policy(
+        ctx,
+        project_key,
+        program,
+        model,
+        name,
+        task_description,
+        attachments_policy,
+        reaper_exempt,
+        pane_id,
+        tmux_socket_path,
+        registration_proof,
+        TokenPolicy::Rotate,
+    )
+    .await
+}
+
+/// What a registration does to an existing agent's registration token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenPolicy {
+    /// Issue a fresh token, as `register_agent` always does: the most recent
+    /// registrant is the one that can prove it owns the name.
+    Rotate,
+    /// Leave an existing agent's token alone and do not return it; an agent
+    /// registered for the first time still gets one. For tools that register
+    /// only as a convenience (`macro_prepare_thread`), where rotating would
+    /// silently invalidate the running agent's `sender_token`.
+    KeepExisting,
+}
+
+/// `register_agent` with an explicit [`TokenPolicy`].
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+pub(crate) async fn register_agent_with_token_policy(
+    ctx: &McpContext,
+    project_key: String,
+    program: String,
+    model: String,
+    name: Option<String>,
+    task_description: Option<String>,
+    attachments_policy: Option<String>,
+    reaper_exempt: Option<bool>,
+    pane_id: Option<String>,
+    tmux_socket_path: Option<String>,
+    registration_proof: Option<String>,
+    token_policy: TokenPolicy,
+) -> McpResult<String> {
     use mcp_agent_mail_core::models::{detect_agent_name_mistake, generate_agent_name};
 
     let tmux_socket_path = validated_tmux_socket_path(tmux_socket_path.as_deref())?;
@@ -2586,6 +2757,23 @@ Check that all parameters have valid values."
         .await?;
     }
 
+    // GH#279 (opt-in): naming an existing agent never binds it to this
+    // session, and a session that holds another identity in this project may
+    // not rewrite this agent's profile or rotate its token.
+    let existing_before = if crate::session_identity::enabled()
+        && let Some(agent_name) = explicit_name.as_deref()
+    {
+        match mcp_agent_mail_db::queries::get_agent(ctx.cx(), &pool, project_id, agent_name).await {
+            asupersync::Outcome::Ok(existing) => Some(existing),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(existing) = &existing_before {
+        crate::session_identity::authorize_actor(ctx, existing, false, "re-register")?;
+    }
+
     let mut row = if let Some(agent_name) = explicit_name {
         // Explicit name: documented upsert/idempotent-re-registration
         // semantics (refresh program/model/task, bump last_active_ts).
@@ -2646,16 +2834,27 @@ Check that all parameters have valid values."
     enqueue_agent_semantic_index(&row);
 
     // Generate and persist a registration token for sender identity verification.
-    // Every registration (new or update) rotates the token so that only the
-    // most recent registrant can prove ownership.
-    let mut registration_token = match mcp_agent_mail_core::setup::generate_registration_token() {
-        Ok(token) => token,
-        Err(error) => {
-            tracing::warn!(
-                "failed to generate registration_token for agent {}: {error}",
-                row.name
-            );
-            String::new()
+    // Under TokenPolicy::Rotate every registration (new or update) rotates the
+    // token so that only the most recent registrant can prove ownership; under
+    // KeepExisting an agent that already has one keeps it (and it is not
+    // returned).
+    let keep_existing_token = token_policy == TokenPolicy::KeepExisting
+        && row
+            .registration_token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty());
+    let mut registration_token = if keep_existing_token {
+        String::new()
+    } else {
+        match mcp_agent_mail_core::setup::generate_registration_token() {
+            Ok(token) => token,
+            Err(error) => {
+                tracing::warn!(
+                    "failed to generate registration_token for agent {}: {error}",
+                    row.name
+                );
+                String::new()
+            }
         }
     };
     if !registration_token.is_empty()
@@ -2685,6 +2884,14 @@ Check that all parameters have valid values."
     // to unverified.  Only set when persistence succeeded.
     if !registration_token.is_empty() {
         row.registration_token = Some(registration_token.clone());
+    }
+
+    // GH#279 (opt-in): this session established the agent when it created
+    // it, or already held it.
+    if let Some(agent_id) = row.id
+        && (existing_before.is_none() || crate::session_identity::holds(ctx, row.id))
+    {
+        crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
     }
 
     // Invalidate + repopulate read cache after mutation. Scope to the live
@@ -2784,7 +2991,7 @@ Check that all parameters have valid values."
     reason = "MCP tool signatures mirror the public JSON-RPC schema"
 )]
 #[tool(
-    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nNote: unlike the Python server, this server has no per-session identity binding, so a\ncaller that opts out of the token echo sends messages with `verified_sender: false`\nunless it obtains the token through an operator/admin path. Under the fail-closed send\nprofile a sender token is mandatory; only opt out of the echo if you have another way\nto obtain the token.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
+    description = "Create a new, unique agent identity and persist its profile to Git.\n\nHow this differs from `register_agent`\n--------------------------------------\n- Always creates a new identity with a fresh unique name (never updates an existing one).\n- `name_hint`, if provided, MUST be a valid adjective+noun combination and must be available,\n  otherwise an error is raised. Without a hint, a random adjective+noun name is generated.\n\nCRITICAL: Agent Naming Rules\n-----------------------------\n- Agent names MUST be randomly generated adjective+noun combinations\n- Examples: \"GreenCastle\", \"BlueLake\", \"RedStone\", \"PurpleBear\"\n- Names should be unique, easy to remember, and NOT descriptive\n- INVALID examples: \"BackendHarmonizer\", \"DatabaseMigrator\", \"UIRefactorer\"\n- Best practice: Omit `name_hint` to auto-generate a valid name (RECOMMENDED)\n\nWhen to use\n-----------\n- Spawning a brand new worker agent that should not overwrite an existing profile.\n- Temporary task-specific identities (e.g., short-lived refactor assistants).\n\nReturns\n-------\ndict\n    { id, name, program, model, task_description, inception_ts, last_active_ts, project_id }\n\nExamples\n--------\nAuto-generate name (RECOMMENDED):\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c2\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"claude-code\",\"model\":\"opus-4.1\"\n}}}\n```\n\nWith valid name hint:\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c1\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5-codex\",\"name_hint\":\"GreenCastle\",\n  \"task_description\":\"DB migration spike\"\n}}}\n```\n\nOptional cryptographic proof gate\n---------------------------------\nSame gate as `register_agent`: by default no proof is needed. When the operator enables\n`[registration.proof_gate]`, pass a signed proof bundle as `registration_proof`; otherwise\nregistration fails closed.\n\nTranscript-safe creation\n------------------------\n`return_registration_token : bool, default true`. When true (default), the response\nincludes the freshly-minted `registration_token`. When false, the token is omitted from\nthe tool result so transcript-visible MCP sessions can satisfy a \"do not echo secrets\ninto scrollback\" contract, and the response carries `registration_token_returned: false`\ninstead. The token still exists server-side (it is generated and persisted either way).\nWhen the operator enables session-bound identity (`MESSAGING_SESSION_IDENTITY=true`),\nthe new identity is bound to this MCP session (stdio process, or Streamable HTTP\nsession via `Mcp-Session-Id`): the session sends and replies as it with\n`verified_sender: true` and no `sender_token`, also under the fail-closed send profile,\nand cannot act as other agents of the project by naming them. Without that setting a\ncaller that opts out of the token echo sends with `verified_sender: false` unless it\nobtains the token through an operator/admin path, and under the fail-closed send profile\na sender token is mandatory.\n\n```json\n{\"jsonrpc\":\"2.0\",\"id\":\"c3\",\"method\":\"tools/call\",\"params\":{\"name\":\"create_agent_identity\",\"arguments\":{\n  \"project_key\":\"/data/projects/backend\",\"program\":\"codex-cli\",\"model\":\"gpt5\",\n  \"return_registration_token\":false\n}}}\n```"
 )]
 pub async fn create_agent_identity(
     ctx: &McpContext,
@@ -3027,6 +3234,12 @@ Choose a different name (or omit the name to auto-generate one)."
         }
     }
 
+    // GH#279 (opt-in): a freshly created identity belongs to this session, so
+    // it can act as that agent without the token in its transcript.
+    if let Some(agent_id) = row.id {
+        crate::session_identity::bind(ctx, project_id, agent_id, &row.name);
+    }
+
     // Transcript safety (GH#255, Python-parity with issue #154): when the
     // caller opts out of the token echo, omit the token from the tool result
     // entirely and mark the omission explicitly. The token was still
@@ -3133,6 +3346,8 @@ pub async fn retire_agent(
         )
         .await,
     )?;
+    // GH#279: a retired identity no longer belongs to the calling session.
+    crate::session_identity::unbind(ctx, agent_id);
     let agent_json = agent_archive_profile_json(&updated, None);
     try_write_agent_profile(&Config::get(), &project.slug, &agent_json);
 
@@ -3261,6 +3476,8 @@ pub async fn deregister_agent(
         )
         .await,
     )?;
+    // GH#279: a deregistered identity no longer belongs to the calling session.
+    crate::session_identity::unbind(ctx, agent_id);
     // Read back the ledger timestamp so concurrent/idempotent retries archive
     // the authoritative first deregistration time, never a later candidate.
     let deregistered_at = db_outcome_to_mcp_result(
@@ -3563,14 +3780,26 @@ pub async fn resolve_pane_identity(
 #[tool(
     description = "Remove stale per-pane identity files for tmux panes that no longer exist.\n\nQueries tmux for live panes and removes identity files that reference dead panes.\nSafety: does nothing if tmux is not running (to avoid accidentally removing everything).\n\nParameters\n----------\nproject_key : Optional[str]\n    If provided, only clean up identity files for this project.\n    If omitted, clean up across all projects.\n\nReturns\n-------\ndict\n    { removed_count, removed_paths }"
 )]
-pub fn cleanup_pane_identities(
-    _ctx: &McpContext,
+pub async fn cleanup_pane_identities(
+    ctx: &McpContext,
     project_key: Option<String>,
 ) -> McpResult<String> {
-    let removed = project_key
-        .map_or_else(mcp_agent_mail_core::cleanup_all_stale_identities, |key| {
+    let removed = match project_key {
+        None => mcp_agent_mail_core::cleanup_all_stale_identities(),
+        Some(key) => {
+            // Identity files are keyed by the project's path: resolve a slug to
+            // it, as resolve_pane_identity does, or a slug cleans nothing.
+            let key = if !Path::new(&key).is_absolute()
+                && let Ok(pool) = get_read_db_pool(ctx.cx()).await
+                && let Ok(project) = resolve_existing_project(ctx, &pool, &key).await
+            {
+                project.human_key
+            } else {
+                key
+            };
             mcp_agent_mail_core::cleanup_stale_identities(&key)
-        });
+        }
+    };
 
     let paths: Vec<String> = removed
         .iter()
@@ -3700,6 +3929,7 @@ mod tests {
             checks_total: 1,
             failures_total: 0,
             failures_since_last_ok: 0,
+            never_written_orphan_pages: 0,
         }
     }
 
@@ -3901,7 +4131,7 @@ mod tests {
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
         metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
 
-        let verdict = integrity_health_verdict(&metrics);
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(verdict.status, "red");
         assert!(verdict.critical);
         assert!(verdict.detail.contains("later quick check cannot clear it"));
@@ -3910,8 +4140,28 @@ mod tests {
         metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Passed;
         metrics.last_check_ts = 300;
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Full);
-        let repaired = integrity_health_verdict(&metrics);
+        let repaired = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(repaired.status, "green");
+    }
+
+    /// GH#291: an accepted full check that carries proven never-written
+    /// orphan pages is an advisory, never a critical verdict.
+    #[test]
+    fn never_written_orphan_pages_are_a_non_critical_yellow_advisory() {
+        let mut metrics = healthy_integrity_metrics();
+        metrics.never_written_orphan_pages = 425;
+
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
+        assert_eq!(verdict.status, "yellow");
+        assert!(!verdict.critical, "leaked space must not gate the roll-up");
+        assert!(verdict.detail.contains("425 never-written orphan page(s)"));
+        assert!(verdict.detail.contains("not data damage"));
+
+        // A failed full check outranks the advisory.
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        let failed = integrity_health_verdict(&Config::default(), &metrics, 0);
+        assert_eq!(failed.status, "red");
+        assert!(failed.critical);
     }
 
     #[test]
@@ -3921,9 +4171,62 @@ mod tests {
         metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
         metrics.last_check_kind = Some(mcp_agent_mail_db::CheckKind::Quick);
 
-        let verdict = integrity_health_verdict(&metrics);
+        let verdict = integrity_health_verdict(&Config::default(), &metrics, 0);
         assert_eq!(verdict.status, "yellow");
         assert!(verdict.critical);
+    }
+
+    #[test]
+    fn skipped_startup_health_reports_schedule_then_full_success_then_failure() {
+        let mut config = Config {
+            integrity_check_on_startup: false,
+            ..Config::default()
+        };
+        let mut metrics = healthy_integrity_metrics();
+        metrics.last_full_check_ts = 0;
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        let due = u64::try_from(mcp_agent_mail_db::now_micros()).unwrap() + 300_000_000;
+        let waiting = integrity_health_verdict(&config, &metrics, due);
+        assert_eq!(waiting.status, "yellow");
+        assert!(waiting.critical);
+        assert!(
+            waiting
+                .detail
+                .contains("skipped by configuration (INTEGRITY_CHECK_ON_STARTUP=false)")
+        );
+        assert!(waiting.detail.contains(&format!(
+            "first periodic check due at {}",
+            mcp_agent_mail_db::micros_to_iso(i64::try_from(due).unwrap())
+        )));
+        let unavailable = integrity_health_verdict(&config, &metrics, 0);
+        assert!(unavailable.detail.contains("has not been scheduled"));
+
+        metrics = healthy_integrity_metrics();
+        assert_eq!(
+            integrity_health_verdict(&config, &metrics, due).status,
+            "green"
+        );
+        config.integrity_guard_enabled = false;
+        let disabled = integrity_health_verdict(&config, &metrics, 0);
+        assert_eq!(disabled.status, "yellow");
+        assert!(disabled.detail.contains("INTEGRITY_GUARD_ENABLED=false"));
+
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        assert_eq!(integrity_health_verdict(&config, &metrics, 0).status, "red");
+        metrics.last_full_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Failed;
+        assert_eq!(integrity_health_verdict(&config, &metrics, 0).status, "red");
+        metrics.last_check_outcome = mcp_agent_mail_db::IntegrityCheckOutcome::Unknown;
+        config.integrity_guard_enabled = true;
+        config.integrity_check_interval_hours = 0;
+        let no_full_checks = integrity_health_verdict(&config, &metrics, due);
+        assert_eq!(no_full_checks.status, "yellow");
+        assert!(
+            no_full_checks
+                .detail
+                .contains("INTEGRITY_CHECK_INTERVAL_HOURS=0")
+        );
     }
 
     #[test]
@@ -4157,6 +4460,304 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static HEALTH_CHECK_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn retention_inventory_failure_is_yellow_and_not_database_corruption() {
+        use mcp_agent_mail_core::HealthLevel;
+        let verdict = retention_health_verdict(&Err("injected inventory failure".to_string()));
+        assert_eq!(verdict.level(), HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert!(verdict.detail.contains("injected inventory failure"));
+        assert_eq!(HealthLevel::Red.max(verdict.level()), HealthLevel::Red);
+    }
+
+    #[test]
+    fn memory_retention_is_inapplicable_without_inspecting_storage() {
+        let config = Config {
+            database_url: "sqlite:///:memory:".to_string(),
+            storage_root: PathBuf::from("/not-inspected-by-retention"),
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(matches!(&result, Ok(None)));
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            mcp_agent_mail_core::HealthLevel::Green
+        );
+    }
+
+    #[test]
+    fn retention_probe_reports_resident_debt_from_actual_staging_files() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-probe");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(4_096)
+            .unwrap();
+        let mut config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert!(response.resident_attention);
+        assert!(!response.reclaimable_attention);
+        assert_eq!(response.resident_bytes, 4_096);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["resident_attention"], true);
+
+        config.doctor_retention_alert_bytes = 0;
+        let disabled = health_check_retention_block(&config);
+        assert_eq!(
+            retention_health_verdict(&disabled).level(),
+            HealthLevel::Green
+        );
+        let disabled = disabled.unwrap().unwrap();
+        assert_eq!(disabled.resident_bytes, 4_096);
+        assert!(!disabled.resident_attention);
+        assert!(!disabled.reclaimable_attention);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_probe_does_not_hide_a_staging_symlink_as_an_absent_block() {
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let linked = root.join(".mcp-agent-mail-proactive-backup-linked");
+        std::os::unix::fs::symlink(&root, &linked).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            // Disabling byte alarms must not turn an inventory error green.
+            doctor_retention_alert_bytes: 0,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        assert!(
+            result.is_err(),
+            "unavailable inventory must not become Ok(None)"
+        );
+        let verdict = retention_health_verdict(&result);
+        assert_eq!(verdict.level(), mcp_agent_mail_core::HealthLevel::Yellow);
+        assert!(!verdict.critical);
+        assert_eq!(std::fs::read_link(&linked).unwrap(), root);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_keeps_resident_attention_after_move_only_consolidation() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-move");
+        std::fs::create_dir(&stage).unwrap();
+        let evidence = [7_u8; 4_096];
+        std::fs::write(stage.join("snapshot.sqlite3"), evidence).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root.clone(),
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let before = health_check_retention_block(&config).unwrap().unwrap();
+        assert!(before.resident_attention);
+        assert!(!before.reclaimable_attention);
+        assert_eq!(before.resident_bytes, 4_096);
+        assert_eq!(
+            before.resident_bytes_by_category["proactive_backup_staging"],
+            4_096
+        );
+
+        // An operator's explicit move changes the category, not the disk debt.
+        // No health code is authorized to perform this move itself.
+        let destination = root.join("doctor/reclaimable/health-move");
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::rename(&stage, &destination).unwrap();
+        let result = health_check_retention_block(&config);
+        let after = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(after.resident_bytes, before.resident_bytes);
+        assert_eq!(after.reclaimable_staging_bytes, 4_096);
+        assert_eq!(
+            after.resident_bytes_by_category["reclaimable_staging"],
+            4_096
+        );
+        assert!(after.resident_attention);
+        assert!(!after.reclaimable_attention);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        assert_eq!(
+            std::fs::read(destination.join("snapshot.sqlite3")).unwrap(),
+            evidence
+        );
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_preserves_the_independent_reclaimable_alarm() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 128]).unwrap();
+        let debris = root.join("retention.db.corrupt7");
+        std::fs::write(&debris, [7_u8; 1_024]).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 512,
+            // The effective category budget is 5 * 128 = 640 bytes, so
+            // this quarantine is selected even though resident < 20 * 128.
+            doctor_retention_max_bytes_per_category: 1,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(response.resident_bytes, 1_024);
+        assert_eq!(response.reclaimable_bytes, 1_024);
+        assert!(!response.resident_attention);
+        assert!(response.reclaimable_attention);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Yellow
+        );
+        assert_eq!(std::fs::read(&debris).unwrap(), [7_u8; 1_024]);
+        assert_eq!(std::fs::read(&primary).unwrap(), [0_u8; 128]);
+    }
+
+    #[test]
+    fn retention_probe_keeps_large_mailbox_backups_below_the_ratio_green() {
+        use mcp_agent_mail_core::HealthLevel;
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("retention.db");
+        std::fs::write(&primary, [0_u8; 1_024]).unwrap();
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-ratio");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("snapshot.sqlite3"), [7_u8; 4_096]).unwrap();
+        let config = Config {
+            database_url: format!("sqlite:///{}", primary.display()),
+            storage_root: root,
+            doctor_retention_alert_bytes: 512,
+            ..Config::default()
+        };
+        let result = health_check_retention_block(&config);
+        let response = result.as_ref().unwrap().as_ref().unwrap();
+        assert_eq!(response.resident_bytes, 4_096);
+        assert!(!response.resident_attention);
+        assert!(!response.reclaimable_attention);
+        assert_eq!(
+            retention_health_verdict(&result).level(),
+            HealthLevel::Green
+        );
+        assert_eq!(
+            std::fs::read(stage.join("snapshot.sqlite3")).unwrap(),
+            [7_u8; 4_096]
+        );
+    }
+
+    #[test]
+    fn retention_response_accepts_legacy_payloads_without_the_resident_flag() {
+        let legacy = json!({
+            "resident_bytes": 1_024,
+            "resident_bytes_by_category": {"direct_backup": 1_024},
+            "reclaimable_staging_bytes": 0,
+            "reclaimable_bytes": 0,
+            "live_database_bytes": 128,
+            "reclaimable_attention": false,
+        });
+        let response: RetentionHealthResponse = serde_json::from_value(legacy).unwrap();
+        assert!(!response.resident_attention);
+        assert_eq!(response.resident_bytes, 1_024);
+    }
+
+    #[test]
+    fn health_check_retention_contributor_reports_the_live_inventory() {
+        let _guard = HEALTH_CHECK_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = tempfile::tempdir().unwrap().keep().canonicalize().unwrap();
+        let primary = root.join("storage.sqlite3");
+        let conn = DbConn::open_file(primary.to_string_lossy().as_ref()).unwrap();
+        conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+            .unwrap();
+        drop(conn);
+        let bytes = std::fs::metadata(&primary)
+            .unwrap()
+            .len()
+            .checked_mul(21)
+            .unwrap()
+            .max(1_024);
+        let stage = root.join(".mcp-agent-mail-proactive-backup-health-response");
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::File::create(stage.join("snapshot.sqlite3"))
+            .unwrap()
+            .set_len(bytes)
+            .unwrap();
+        with_process_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", &format!("sqlite:///{}", primary.display())),
+                ("STORAGE_ROOT", &root.display().to_string()),
+                ("DOCTOR_RETENTION_ALERT_BYTES", "512"),
+            ],
+            || {
+                Config::reset_cached();
+                assert_eq!(Config::get().doctor_retention_alert_bytes, 512);
+                let ctx = McpContext::new(Cx::for_testing(), 1);
+                let response = health_check(&ctx).expect("health response");
+                let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(value["retention"]["resident_attention"], true, "{value}");
+                assert_eq!(
+                    value["retention"]["reclaimable_attention"], false,
+                    "{value}"
+                );
+                assert_eq!(
+                    value["retention"]["resident_bytes_by_category"]["proactive_backup_staging"],
+                    bytes,
+                    "{value}"
+                );
+                let contributor = value["health_level_contributors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["name"] == "retention")
+                    .unwrap_or_else(|| panic!("retention contributor missing: {value}"));
+                assert_eq!(contributor["level"], "yellow", "{value}");
+                assert!(
+                    contributor["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("this is not database corruption"),
+                    "{value}"
+                );
+                // Independent live signals may be red. Retention must never
+                // erase them, and a retention alarm must never leave green.
+                assert!(
+                    matches!(value["health_level"].as_str(), Some("yellow" | "red")),
+                    "{value}"
+                );
+            },
+        );
+        assert_eq!(
+            std::fs::metadata(stage.join("snapshot.sqlite3"))
+                .unwrap()
+                .len(),
+            bytes
+        );
+    }
 
     // ── redact_database_url ──
 
@@ -4784,6 +5385,7 @@ mod tests {
                 archive_wbq_p99_us: 0,
                 archive_commit_queue_p99_us: 16_778_000,
                 git_commit_p99_us: 450_000,
+                archive_fence_wait_us: 0,
                 blocking_dispatch: mcp_agent_mail_core::metrics::BlockingDispatchMetricsSnapshot {
                     inflight: 1,
                     zombies: 0,
@@ -4921,12 +5523,14 @@ mod tests {
             reclaimable_bytes: 540,
             live_database_bytes: None,
             reclaimable_attention: true,
+            resident_attention: true,
         };
         let value = serde_json::to_value(&r).unwrap();
         let object = value.as_object().expect("retention object");
         assert!(!object.contains_key("live_database_bytes"));
         assert_eq!(value["resident_bytes"], 630);
         assert_eq!(value["reclaimable_attention"], true);
+        assert_eq!(value["resident_attention"], true);
         assert_eq!(value["resident_bytes_by_category"]["stale_artifact"], 40);
         assert!(
             value["resident_bytes_by_category"]

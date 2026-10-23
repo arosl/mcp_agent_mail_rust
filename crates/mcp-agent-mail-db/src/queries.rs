@@ -59,6 +59,9 @@ thread_local! {
     /// visibility probe on this thread started (br-kp1in.32 regression test).
     static SERIALIZER_LOCKED_AT_PROBE: std::cell::RefCell<Vec<bool>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The same, for each writer post-commit sample (br-qbhs0).
+    static SERIALIZER_LOCKED_AT_WRITER_SAMPLE: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Fresh durability-probe connections opened on this thread (br-v0ucm).
     static DURABILITY_PROBE_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1786,6 +1789,89 @@ fn wal_checkpoint_progress(rows: &[SqlRow]) -> Option<WalCheckpointProgress> {
     })
 }
 
+/// Smallest WAL a reset is attempted for, whatever `journal_size_limit` says:
+/// a zero limit must not make every contended commit hold the pool.
+const WAL_RESET_MIN_BYTES: i64 = 1 << 20;
+/// How long a WAL reset waits for in-flight transactions before it reopens
+/// the pool without truncating.
+const WAL_RESET_DRAIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+/// After a reset that could not truncate, commits skip resets for this long.
+const WAL_RESET_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether `wal_frames` WAL frames exceed this connection's
+/// `journal_size_limit`. A negative limit (unbounded WAL) never does.
+fn wal_exceeds_journal_size_limit(conn: &crate::DbConn, wal_frames: i64) -> bool {
+    if wal_frames <= 0 {
+        return false;
+    }
+    let pragma = |sql: &str| {
+        conn.query_sync(sql, &[])
+            .ok()?
+            .first()?
+            .get(0)
+            .and_then(value_as_i64)
+    };
+    let (Some(limit), Some(page_size)) = (
+        pragma("PRAGMA journal_size_limit;"),
+        pragma("PRAGMA page_size;"),
+    ) else {
+        return false;
+    };
+    // Each WAL frame is a 24-byte header plus one page.
+    limit >= 0
+        && wal_frames.saturating_mul(page_size.saturating_add(24)) > limit.max(WAL_RESET_MIN_BYTES)
+}
+
+/// Truncate an over-limit WAL after a commit whose checkpoint was refused
+/// (br-v0ucm). FrankenSQLite refuses every checkpoint while any concurrent
+/// transaction is active, so under continuous load the WAL never resets.
+/// This closes `gate` ([`crate::pool::WAL_RESET_GATE`] outside tests) so new
+/// checkouts wait, retries a zero-wait TRUNCATE until the in-flight
+/// transactions finish, and reopens the gate. Returns whether the WAL was
+/// truncated. A truncate also publishes this commit, so the caller keeps its
+/// connection.
+fn reset_over_limit_wal(cx: &Cx, conn: &crate::DbConn, gate: &crate::pool::WalResetGate) -> bool {
+    let Some(_hold) = gate.try_close() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts += 1;
+        match conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE);", &[]) {
+            Ok(rows)
+                if wal_checkpoint_progress(&rows)
+                    .is_some_and(WalCheckpointProgress::fully_published) =>
+            {
+                tracing::debug!(
+                    db_path = %conn.path(),
+                    attempts,
+                    waited_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    "wal_reset_truncated"
+                );
+                return true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!(
+                    db_path = %conn.path(),
+                    error = %error,
+                    "wal_reset_checkpoint_failed"
+                );
+                break;
+            }
+        }
+        if started.elapsed() >= WAL_RESET_DRAIN_BUDGET || cx.checkpoint().is_err() {
+            break;
+        }
+        // Commits run on blocking workers (see `mvcc_backoff`).
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    gate.defer_retry(WAL_RESET_RETRY_COOLDOWN);
+    tracing::debug!(db_path = %conn.path(), attempts, "wal_reset_deferred");
+    false
+}
+
 async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbError> {
     match map_sql_outcome(tracked.execute(cx, "COMMIT", &[]).await) {
         Outcome::Ok(_) => {
@@ -1801,6 +1887,17 @@ async fn commit_tx(cx: &Cx, tracked: &TrackedConnection<'_>) -> Outcome<(), DbEr
                                 .is_some_and(WalCheckpointProgress::fully_published) =>
                         {
                             // Canonical publication completed without waiting.
+                        }
+                        Ok(rows)
+                            if wal_checkpoint_progress(&rows).is_some_and(|progress| {
+                                wal_exceeds_journal_size_limit(tracked.inner, progress.log)
+                            }) && reset_over_limit_wal(
+                                cx,
+                                tracked.inner,
+                                &crate::pool::WAL_RESET_GATE,
+                            ) =>
+                        {
+                            // The truncate published this commit too.
                         }
                         Ok(rows) => {
                             retire = true;
@@ -8057,6 +8154,7 @@ pub async fn create_message_with_recipients(
         ack_required,
         attachments,
         recipients,
+        None,
     )
     .await
 }
@@ -8066,6 +8164,10 @@ pub async fn create_message_with_recipients(
 /// `reply_to` is the immediate parent, never inferred from `thread_id`. `None`
 /// records authoritative absence, allowing a fresh threaded send to recover
 /// even if its first archive write and journal enqueue both fail.
+///
+/// `project_mailbox` is `Some(kind)` (`to` or `cc`) when the message is also
+/// addressed to its project's shared mailbox (GH#282): one
+/// `project_mailbox_deliveries` row is written in the same transaction.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_message_with_recipients_topic(
     cx: &Cx,
@@ -8081,6 +8183,7 @@ pub async fn create_message_with_recipients_topic(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
 ) -> Outcome<MessageRow, DbError> {
     match create_message_with_recipients_impl(
         cx,
@@ -8096,6 +8199,7 @@ pub async fn create_message_with_recipients_topic(
         ack_required,
         attachments,
         recipients,
+        project_mailbox,
         None,
     )
     .await
@@ -8154,6 +8258,7 @@ pub async fn create_message_with_recipients_idempotent(
         ack_required,
         attachments,
         recipients,
+        None,
         claim,
     )
     .await
@@ -8175,6 +8280,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
     claim: IdempotencyClaim<'_>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
     create_message_with_recipients_impl(
@@ -8191,6 +8297,7 @@ pub async fn create_message_with_recipients_idempotent_topic(
         ack_required,
         attachments,
         recipients,
+        project_mailbox,
         Some(claim),
     )
     .await
@@ -8211,8 +8318,15 @@ async fn create_message_with_recipients_impl(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)], // (agent_id, kind)
+    project_mailbox: Option<&str>,
     idempotency: Option<IdempotencyClaim<'_>>,
 ) -> Outcome<IdempotentOutcome<MessageRow>, DbError> {
+    if project_mailbox.is_some_and(|kind| !matches!(kind, "to" | "cc")) {
+        return Outcome::Err(DbError::InvalidArgument {
+            field: "project_mailbox",
+            message: "a project mailbox delivery is addressed as to or cc".to_string(),
+        });
+    }
     if reply_to.is_some_and(|parent| parent <= 0)
         || (reply_to.is_some() && thread_id.is_none_or(str::is_empty))
     {
@@ -8222,9 +8336,9 @@ async fn create_message_with_recipients_impl(
                 .to_string(),
         });
     }
-    // Held from id election through the insert transaction and the writer's own
-    // post-commit sample, then released before the fresh-handle visibility
-    // probe (br-kp1in.32).
+    // Held from id election through the insert transaction, then released
+    // before the writer's post-commit sample and the fresh-handle visibility
+    // probe (br-kp1in.32, br-qbhs0).
     let serializer_guard = match lock_message_write_serializer(cx).await {
         Ok(guard) => guard,
         Err(asupersync::sync::LockError::Cancelled) => {
@@ -8261,7 +8375,7 @@ async fn create_message_with_recipients_impl(
     let now = now_micros();
     let idempotency_expires_ts =
         now.saturating_add(idempotency_retention_secs().saturating_mul(1_000_000));
-    let (row, writer_post_commit_counts) = {
+    let (row, conn) = {
         // mcp_agent_mail#176 / br-sa58k: the canonical message id is elected
         // durably inside the insert transaction (see
         // `create_message_with_recipients_tx`) rather than relying on the
@@ -8322,6 +8436,7 @@ async fn create_message_with_recipients_impl(
                     ack_required,
                     attachments,
                     recipients,
+                    project_mailbox,
                     now,
                     archive_seed,
                     idempotency,
@@ -8368,7 +8483,6 @@ async fn create_message_with_recipients_impl(
                 Outcome::Panicked(p) => return Outcome::Panicked(p),
             }
         };
-        let tracked = tracked(&*conn);
         // A replay or conflict short-circuits: nothing new was written this call,
         // so the post-commit visibility probe (which re-proves a fresh insert
         // landed) and the writer-count sample below must be skipped entirely.
@@ -8390,8 +8504,23 @@ async fn create_message_with_recipients_impl(
                 return Outcome::Ok(IdempotentOutcome::Conflict(info));
             }
         };
-
-        let writer_post_commit_counts = if let Some(message_id) = row.id {
+        (row, conn)
+    };
+    // The insert is committed. The writer samples its own rows and the
+    // fresh-handle probe re-proves them without the serializer, so neither
+    // holds every other in-process send behind it (br-kp1in.32, br-qbhs0: the
+    // sample was ~10% of the serializer's hold). Only this call's compensating
+    // delete can remove these rows, and it re-takes the serializer. A probe
+    // miss still cannot delete a message the writer's sample confirmed
+    // (GH#179).
+    drop(serializer_guard);
+    #[cfg(test)]
+    SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| {
+        seen.borrow_mut().push(MESSAGE_WRITE_SERIALIZER.is_locked());
+    });
+    let writer_post_commit_counts = {
+        let tracked = tracked(&*conn);
+        if let Some(message_id) = row.id {
             let message_rows = match map_sql_outcome(
                 traw_query(
                     cx,
@@ -8422,17 +8551,9 @@ async fn create_message_with_recipients_impl(
             }
         } else {
             WriterPostCommitCounts::default()
-        };
-
-        drop(conn);
-        (row, writer_post_commit_counts)
+        }
     };
-    // The insert is committed and the writer sampled its own rows; the
-    // fresh-handle probe below opens its own connections per query and must not
-    // hold every other in-process send behind it. A probe miss still cannot
-    // delete a message the writer's sample confirmed (GH#179), and the rare
-    // compensating delete re-takes the serializer.
-    drop(serializer_guard);
+    drop(conn);
 
     let Some(message_id) = row.id else {
         return Outcome::Err(DbError::Internal(
@@ -8622,6 +8743,7 @@ async fn create_message_with_recipients_tx(
     ack_required: bool,
     attachments: &str,
     recipients: &[(i64, &str)],
+    project_mailbox: Option<&str>,
     now: i64,
     archive_seed: Option<i64>,
     idempotency: Option<IdempotencyClaim<'_>>,
@@ -8740,6 +8862,38 @@ async fn create_message_with_recipients_tx(
         }
     }
 
+    // GH#282: the shared-mailbox address appears in the slot the sender used,
+    // so every reader of the envelope (and the archive frontmatter) shows that
+    // the message went to the project, not only to the named agents.
+    if let Some(kind) = project_mailbox {
+        let slug_rows = try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_query(
+                    cx,
+                    tracked,
+                    "SELECT slug FROM projects WHERE id = ?",
+                    &[Value::BigInt(project_id)],
+                )
+                .await
+            )
+        );
+        let Some(slug) = slug_rows
+            .first()
+            .and_then(|row| row.get_as::<String>(0).ok())
+        else {
+            rollback_tx(cx, tracked).await;
+            return Outcome::Err(DbError::not_found("Project", project_id.to_string()));
+        };
+        let address = crate::project_mailbox::project_mailbox_address(&slug);
+        if kind == "cc" {
+            cc_names.push(address);
+        } else {
+            to_names.push(address);
+        }
+    }
+
     let recipients_json_val = serde_json::json!({
         "to": to_names,
         "cc": cc_names,
@@ -8852,6 +9006,48 @@ async fn create_message_with_recipients_tx(
                 return Outcome::Panicked(payload);
             }
         }
+    }
+
+    // GH#282: one delivery row for the project's shared mailbox. Per-agent
+    // read/ack receipts are created lazily, never here.
+    if let Some(kind) = project_mailbox {
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    tracked,
+                    "INSERT INTO project_mailbox_deliveries \
+                     (message_id, project_id, kind, delivered_ts) VALUES (?, ?, ?, ?)",
+                    &[
+                        Value::BigInt(message_id),
+                        Value::BigInt(project_id),
+                        Value::Text(kind.to_string()),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
+        // The delivery's single cursor event for restart-safe monitors.
+        try_in_tx!(
+            cx,
+            tracked,
+            map_sql_outcome(
+                traw_execute(
+                    cx,
+                    tracked,
+                    crate::project_mailbox::INSERT_PROJECT_MAILBOX_EVENT_SQL,
+                    &[
+                        Value::BigInt(project_id),
+                        Value::BigInt(message_id),
+                        Value::BigInt(now),
+                    ],
+                )
+                .await
+            )
+        );
     }
 
     let recipient_agent_ids: Vec<i64> = recipients.iter().map(|(id, _)| *id).collect();
@@ -9268,7 +9464,9 @@ pub async fn get_messages_details_by_ids(
 ///
 /// Thread semantics:
 /// - If `thread_id` is a numeric string, it is treated as a root message id.
-///   The thread includes the root message (`id = root`) and any replies (`thread_id = "{root}"`).
+///   The thread includes the root message (`id = root`), any replies
+///   (`thread_id = "{root}"`), and, when the root itself belongs to a named
+///   thread (`thread_id = "TKT-123"`), that whole thread.
 /// - Otherwise, the thread includes messages where `thread_id = thread_id`.
 /// - If `limit` is set, the most recent `limit` messages are selected and returned in
 ///   chronological order (oldest-to-newest within that limited window).
@@ -9280,6 +9478,8 @@ pub async fn list_thread_messages(
     thread_id: &str,
     limit: Option<usize>,
 ) -> Outcome<Vec<ThreadMessageRow>, DbError> {
+    const SEED_THREAD_SQL: &str =
+        "SELECT s.thread_id FROM messages s WHERE s.id = ? AND s.project_id = ?";
     let conn = match acquire_conn(cx, pool).await {
         Outcome::Ok(c) => c,
         Outcome::Err(e) => return Outcome::Err(e),
@@ -9296,6 +9496,10 @@ pub async fn list_thread_messages(
         params.push(Value::BigInt(root_id));
     }
     params.push(Value::Text(thread_id.to_string()));
+    if let Ok(root_id) = thread_id.parse::<i64>() {
+        params.push(Value::BigInt(root_id));
+        params.push(Value::BigInt(project_id));
+    }
 
     let (sql, reverse_to_chronological) = match (is_root, limit) {
         (true, Some(lim)) => {
@@ -9313,7 +9517,7 @@ pub async fn list_thread_messages(
                             COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                      FROM messages m \
                      LEFT JOIN agents a ON a.id = m.sender_id \
-                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                     WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ? OR m.thread_id = ({SEED_THREAD_SQL})) \
                      ORDER BY created_ts DESC, id DESC \
                      LIMIT ?"
                 ),
@@ -9330,7 +9534,7 @@ pub async fn list_thread_messages(
                         COALESCE(a.name, '{UNKNOWN_SENDER_DISPLAY}') AS from_name \
                  FROM messages m \
                  LEFT JOIN agents a ON a.id = m.sender_id \
-                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ?) \
+                 WHERE m.project_id = ? AND (m.id = ? OR m.thread_id = ? OR m.thread_id = ({SEED_THREAD_SQL})) \
                  ORDER BY created_ts ASC, id ASC"
             ),
             false,
@@ -10646,9 +10850,91 @@ fn decode_inbox_row_indexed(row: &SqlRow) -> std::result::Result<InboxRow, DbErr
 }
 
 #[derive(Clone, Copy)]
-struct ProductInboxQueryOptions {
+struct ProductInboxQueryOptions<'a> {
     urgent_only: bool,
     body_policy: InboxBodyPolicy,
+    viewer_ids: Option<&'a [i64]>,
+}
+
+/// Resolve the canonical viewer in every linked project in one read.
+///
+/// Match `get_agent`'s lowest-ID rule for legacy case-variant registrations. The
+/// returned IDs can pin a later inbox read to exactly these identities, even
+/// if product links or same-name registrations change during authorization.
+pub async fn product_inbox_agents(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+) -> Outcome<Vec<AgentRow>, DbError> {
+    let conn = match acquire_conn(cx, pool).await {
+        Outcome::Ok(conn) => conn,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let tracked = tracked(&*conn);
+    let sql = "SELECT a.id, a.project_id, a.name, a.program, a.model, a.task_description, \
+                      a.inception_ts, a.last_active_ts, a.attachments_policy, a.contact_policy, \
+                      a.reaper_exempt, a.registration_token, a.retired_at \
+               FROM product_project_links ppl JOIN agents a ON a.project_id = ppl.project_id \
+               WHERE ppl.product_id = ? AND a.name = ? COLLATE NOCASE \
+               ORDER BY a.project_id ASC, a.id ASC";
+    let params = [
+        Value::BigInt(product_id),
+        Value::Text(agent_name.to_string()),
+    ];
+    match map_sql_outcome(traw_query(cx, &tracked, sql, &params).await) {
+        Outcome::Ok(rows) => {
+            let mut seen_projects = HashSet::new();
+            let agents = rows
+                .iter()
+                .map(decode_agent_row_indexed)
+                .filter(|agent| seen_projects.insert(agent.project_id))
+                .collect();
+            Outcome::Ok(agents)
+        }
+        Outcome::Err(error) => Outcome::Err(error),
+        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+    }
+}
+
+/// Read only the preflighted viewers.
+///
+/// Both mailbox arms still require current
+/// membership in this product; new links or name aliases cannot expand the
+/// caller's authorized identity scope between preflight and the read.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_inbox_for_product_agent_scoped(
+    cx: &Cx,
+    pool: &DbPool,
+    product_id: i64,
+    agent_name: &str,
+    viewer_ids: &[i64],
+    urgent_only: bool,
+    since_ts: Option<i64>,
+    limit: usize,
+    include_bodies: bool,
+) -> Outcome<Vec<InboxRow>, DbError> {
+    fetch_inbox_for_product_agent_impl(
+        cx,
+        pool,
+        product_id,
+        agent_name,
+        since_ts,
+        limit,
+        ProductInboxQueryOptions {
+            urgent_only,
+            body_policy: if include_bodies {
+                InboxBodyPolicy::Full
+            } else {
+                InboxBodyPolicy::MetadataOnly
+            },
+            viewer_ids: Some(viewer_ids),
+        },
+    )
+    .await
 }
 
 pub async fn fetch_inbox_for_product_agent(
@@ -10670,6 +10956,7 @@ pub async fn fetch_inbox_for_product_agent(
         ProductInboxQueryOptions {
             urgent_only,
             body_policy: InboxBodyPolicy::Full,
+            viewer_ids: None,
         },
     )
     .await
@@ -10694,6 +10981,7 @@ pub async fn fetch_inbox_for_product_agent_metadata(
         ProductInboxQueryOptions {
             urgent_only,
             body_policy: InboxBodyPolicy::MetadataOnly,
+            viewer_ids: None,
         },
     )
     .await
@@ -10706,7 +10994,7 @@ async fn fetch_inbox_for_product_agent_impl(
     agent_name: &str,
     since_ts: Option<i64>,
     limit: usize,
-    options: ProductInboxQueryOptions,
+    options: ProductInboxQueryOptions<'_>,
 ) -> Outcome<Vec<InboxRow>, DbError> {
     let Ok(limit_i64) = i64::try_from(limit) else {
         return Outcome::Err(DbError::invalid("limit", "limit exceeds i64::MAX"));
@@ -10736,36 +11024,79 @@ async fn fetch_inbox_for_product_agent_impl(
          WHERE ppl.product_id = ?"
     );
 
-    let mut params = vec![
+    // GH#282: the same agents' views of each linked project's shared mailbox,
+    // under the same filters. Both arms run as ONE fan-in statement whatever
+    // the number of linked projects. The pinned compound-select executor
+    // applies LIMIT without bindings, so the (integer) limit is rendered.
+    let mut shared_sql = crate::project_mailbox::product_inbox_select_sql(body_select);
+    if let Some(viewer_ids) = options.viewer_ids {
+        if viewer_ids.is_empty() {
+            return Outcome::Ok(Vec::new());
+        }
+        // IDs are typed database identities, not caller-supplied SQL. Render
+        // them to avoid multiplying bind parameters across the two arms.
+        let ids = viewer_ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        sql.push_str(" AND recipient.id IN (");
+        sql.push_str(&ids);
+        sql.push(')');
+        shared_sql.push_str(" AND viewer.id IN (");
+        shared_sql.push_str(&ids);
+        shared_sql.push(')');
+    }
+    let mut arm_params = vec![
         Value::Text(UNKNOWN_SENDER_DISPLAY.to_string()),
         Value::Text(agent_name.to_string()),
         Value::BigInt(product_id),
     ];
-    if options.urgent_only {
-        sql.push_str(" AND m.importance IN ('high', 'urgent')");
+    for query in [&mut sql, &mut shared_sql] {
+        if options.urgent_only {
+            query.push_str(" AND m.importance IN ('high', 'urgent')");
+        }
+        if since_ts.is_some() {
+            query.push_str(" AND m.created_ts > ?");
+        }
     }
     if let Some(ts) = since_ts {
-        sql.push_str(" AND m.created_ts > ?");
-        params.push(Value::BigInt(ts));
+        arm_params.push(Value::BigInt(ts));
     }
-    sql.push_str(" ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
-    params.push(Value::BigInt(limit_i64));
+    let compound =
+        format!("{sql} UNION ALL {shared_sql} ORDER BY created_ts DESC, id DESC LIMIT {limit_i64}");
+    let compound_params = [arm_params.as_slice(), arm_params.as_slice()].concat();
 
-    match map_sql_outcome(traw_query(cx, &tracked, &sql, &params).await) {
-        Outcome::Ok(rows) => {
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                match decode_inbox_row_indexed(&row) {
-                    Ok(decoded) => out.push(decoded),
-                    Err(error) => return Outcome::Err(error),
-                }
+    let rows = match map_sql_outcome(traw_query(cx, &tracked, &compound, &compound_params).await) {
+        Outcome::Ok(rows) => rows,
+        // A mailbox read before its schema upgrade has no shared mailbox.
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            let direct = format!("{sql} ORDER BY m.created_ts DESC, m.id DESC LIMIT ?");
+            let mut direct_params = arm_params;
+            direct_params.push(Value::BigInt(limit_i64));
+            match map_sql_outcome(traw_query(cx, &tracked, &direct, &direct_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error) => return Outcome::Err(error),
+                Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => return Outcome::Panicked(payload),
             }
-            Outcome::Ok(out)
         }
-        Outcome::Err(error) => Outcome::Err(error),
-        Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
-        Outcome::Panicked(payload) => Outcome::Panicked(payload),
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        match decode_inbox_row_indexed(&row) {
+            Ok(decoded) => out.push(decoded),
+            Err(error) => return Outcome::Err(error),
+        }
     }
+    Outcome::Ok(out)
 }
 
 /// Search messages using FTS5
@@ -11726,6 +12057,74 @@ pub async fn add_recipients(
 }
 
 /// Mark message as read
+/// GH#282: record a lazy shared-mailbox receipt when `message_id` is a
+/// project mailbox delivery visible to `agent_id`, inside the caller's write
+/// transaction. `Ok(None)` when it is not one, so the caller keeps its
+/// not-a-recipient error; otherwise the stored `(read_ts, ack_ts)`. Never
+/// rolls back: the caller owns the transaction.
+async fn record_project_mailbox_receipt_in_tx(
+    cx: &Cx,
+    tracked: &TrackedConnection<'_>,
+    agent_id: i64,
+    message_id: i64,
+    update: crate::project_mailbox::ReceiptUpdate,
+    now: i64,
+) -> Outcome<Option<(Option<i64>, Option<i64>)>, DbError> {
+    let (sql, params) = crate::project_mailbox::visible_receipt_query(agent_id, message_id);
+    match map_sql_outcome(traw_query(cx, tracked, &sql, &params).await) {
+        Outcome::Ok(rows) if rows.is_empty() => return Outcome::Ok(None),
+        Outcome::Ok(_) => {}
+        Outcome::Err(error)
+            if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                &error.to_string(),
+            ) =>
+        {
+            return Outcome::Ok(None);
+        }
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    }
+    for (sql, params) in
+        crate::project_mailbox::receipt_write_statements(update, message_id, agent_id, now)
+    {
+        match map_sql_outcome(traw_execute(cx, tracked, sql, &params).await) {
+            Outcome::Ok(_) => {}
+            Outcome::Err(error) => return Outcome::Err(error),
+            Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+            Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+        }
+    }
+    let rows = match map_sql_outcome(
+        traw_query(
+            cx,
+            tracked,
+            "SELECT read_ts, ack_ts FROM project_mailbox_receipts \
+             WHERE message_id = ? AND agent_id = ?",
+            &[Value::BigInt(message_id), Value::BigInt(agent_id)],
+        )
+        .await,
+    ) {
+        Outcome::Ok(rows) => rows,
+        Outcome::Err(error) => return Outcome::Err(error),
+        Outcome::Cancelled(reason) => return Outcome::Cancelled(reason),
+        Outcome::Panicked(payload) => return Outcome::Panicked(payload),
+    };
+    let Some(row) = rows.first() else {
+        return Outcome::Err(DbError::Internal(format!(
+            "project mailbox receipt for {agent_id}:{message_id} was not stored"
+        )));
+    };
+    let integer = |index: usize| {
+        row.get(index).and_then(|value| match value {
+            Value::BigInt(n) => Some(*n),
+            Value::Int(n) => Some(i64::from(*n)),
+            _ => None,
+        })
+    };
+    Outcome::Ok(Some((integer(0), integer(1))))
+}
+
 pub async fn mark_message_read(
     cx: &Cx,
     pool: &DbPool,
@@ -11778,14 +12177,32 @@ pub async fn mark_message_read(
             "SELECT read_ts FROM message_recipients WHERE agent_id = ? AND message_id = ?";
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
         let ts = match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-            Outcome::Ok(rows) => {
-                if rows.is_empty() {
+            Outcome::Ok(rows) if rows.is_empty() => {
+                // GH#282: not a direct recipient; a project mailbox delivery
+                // records the agent's own lazy receipt instead.
+                let receipt = try_in_tx!(
+                    cx,
+                    &tracked,
+                    record_project_mailbox_receipt_in_tx(
+                        cx,
+                        &tracked,
+                        agent_id,
+                        message_id,
+                        crate::project_mailbox::ReceiptUpdate::Read,
+                        now,
+                    )
+                    .await
+                );
+                let Some((Some(read_ts), _)) = receipt else {
                     rollback_tx(cx, &tracked).await;
                     return Outcome::Err(DbError::not_found(
                         "MessageRecipient",
                         format!("{agent_id}:{message_id}"),
                     ));
-                }
+                };
+                read_ts
+            }
+            Outcome::Ok(rows) => {
                 let Some(ts) = rows
                     .first()
                     .and_then(|r| r.get(0))
@@ -12143,13 +12560,70 @@ pub async fn mark_messages_read_bulk(
             );
         }
 
+        // GH#282: the remaining budget clears this agent's unread project
+        // mailbox mail (its own lazy receipts). With no budget left, one row
+        // is enough to report that more remains.
+        let shared_budget = limit - message_ids.len();
+        let (shared_sql, shared_params) = crate::project_mailbox::unread_visible_query(
+            agent_id,
+            project_id,
+            older_than_us,
+            i64::try_from(shared_budget.saturating_add(1)).unwrap_or(i64::MAX),
+        );
+        let shared_rows =
+            match map_sql_outcome(traw_query(cx, &tracked, &shared_sql, &shared_params).await) {
+                Outcome::Ok(rows) => rows,
+                Outcome::Err(error)
+                    if crate::project_mailbox::is_missing_project_mailbox_table_error(
+                        &error.to_string(),
+                    ) =>
+                {
+                    Vec::new()
+                }
+                Outcome::Err(error) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Err(error);
+                }
+                Outcome::Cancelled(reason) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Cancelled(reason);
+                }
+                Outcome::Panicked(payload) => {
+                    rollback_tx(cx, &tracked).await;
+                    return Outcome::Panicked(payload);
+                }
+            };
+        let more = more || shared_rows.len() > shared_budget;
+        let mut shared_marked = 0usize;
+        for row in shared_rows.iter().take(shared_budget) {
+            let Some(message_id) = row_first_i64(row) else {
+                rollback_tx(cx, &tracked).await;
+                return Outcome::Err(DbError::Internal(
+                    "bulk mark-read project mailbox query returned a non-integer id".to_string(),
+                ));
+            };
+            for (sql, params) in crate::project_mailbox::receipt_write_statements(
+                crate::project_mailbox::ReceiptUpdate::Read,
+                message_id,
+                agent_id,
+                now,
+            ) {
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, sql, &params).await)
+                );
+            }
+            shared_marked += 1;
+        }
+
         try_in_tx!(cx, &tracked, commit_tx(cx, &tracked).await);
         // Post-commit invalidation — see mark_message_read.
         crate::cache::read_cache()
             .invalidate_inbox_stats_scoped(&cache_scope_for_pool(pool), agent_id);
 
         Outcome::Ok(BulkMarkReadOutcome {
-            marked: u64::try_from(message_ids.len()).unwrap_or(u64::MAX),
+            marked: u64::try_from(message_ids.len() + shared_marked).unwrap_or(u64::MAX),
             more,
         })
     })
@@ -12161,11 +12635,25 @@ pub async fn mark_messages_read_bulk(
 /// requires acknowledgement — every recipient has acknowledged it. A message
 /// with no recipient rows left (e.g. repaired FK orphans) is vacuously
 /// settled. The caller adds the age horizon (`m.created_ts <= ?`).
-const SETTLED_MESSAGE_PREDICATE: &str = "NOT EXISTS (\
+// GH#282: a project mailbox message is settled only once every agent that can
+// see it has read it (and acknowledged it when required). It has no
+// message_recipients rows, so the first clause alone would call it settled at
+// once.
+const SETTLED_MESSAGE_PREDICATE: &str = concat!(
+    "NOT EXISTS (\
      SELECT 1 FROM message_recipients r \
      WHERE r.message_id = m.id \
        AND (r.read_ts IS NULL \
-            OR (m.ack_required != 0 AND r.ack_ts IS NULL)))";
+            OR (m.ack_required != 0 AND r.ack_ts IS NULL))) \
+     AND NOT EXISTS (\
+     SELECT 1 FROM project_mailbox_deliveries d \
+     JOIN agents viewer ON viewer.project_id = d.project_id \
+     LEFT JOIN project_mailbox_receipts pr \
+            ON pr.message_id = d.message_id AND pr.agent_id = viewer.id \
+     WHERE d.message_id = m.id AND ",
+    crate::project_mailbox::visible_to_viewer_sql!(),
+    " AND (pr.read_ts IS NULL OR (m.ack_required != 0 AND pr.ack_ts IS NULL)))"
+);
 
 /// Maximum message payload admitted to an archive observation.
 pub const MESSAGE_ARCHIVE_MAX_PAYLOAD_BYTES: i64 = 4 * 1024 * 1024;
@@ -12182,6 +12670,8 @@ pub const MESSAGE_PRUNE_MAX_CANDIDATES: usize = 32;
 /// body is not repeated for every recipient. Archive verification and the final
 /// retention transaction use this same projection. The final identity/receipt
 /// columns also detect changes that do not alter a rendered recipient name.
+/// A project shared-mailbox delivery (GH#282) is the last row (`row_kind` 2),
+/// named by its `project:<slug>` address, with no recipient id or receipts.
 /// Callers bind message ID, payload-byte limit, and recipient-name-byte limit,
 /// then append the fixed recipient limit plus two rows as an overflow witness.
 pub const MESSAGE_ARCHIVE_SOURCE_SQL: &str = "\
@@ -12215,6 +12705,14 @@ SELECT 1, mr.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, N
             THEN mr.ack_ts ELSE 'invalid_receipt' END \
 FROM message_recipients mr LEFT JOIN agents a ON a.id = mr.agent_id \
 WHERE mr.message_id = ?1 \
+UNION ALL \
+SELECT 2, d.message_id, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+       NULL, NULL, NULL, NULL, d.project_id, \
+       CASE WHEN length(CAST(p.slug AS BLOB)) <= ?3 THEN 'project:' || p.slug ELSE NULL END, \
+       CASE WHEN length(CAST(d.kind AS BLOB)) <= 3 THEN d.kind ELSE NULL END, \
+       NULL, NULL, NULL, NULL \
+FROM project_mailbox_deliveries d LEFT JOIN projects p ON p.id = d.project_id \
+WHERE d.message_id = ?1 \
 ORDER BY row_kind, recipient_id";
 
 const MESSAGE_ARCHIVE_SOURCE_COLUMNS: usize = 24;
@@ -12585,6 +13083,15 @@ pub async fn prune_verified_settled_messages(
                 map_sql_outcome(traw_execute(cx, &tracked, &del_events, &chunk_params).await)
             );
 
+            for table in ["project_mailbox_receipts", "project_mailbox_deliveries"] {
+                let del_shared = format!("DELETE FROM {table} WHERE message_id IN ({ph})");
+                try_in_tx!(
+                    cx,
+                    &tracked,
+                    map_sql_outcome(traw_execute(cx, &tracked, &del_shared, &chunk_params).await)
+                );
+            }
+
             let del_recipients =
                 format!("DELETE FROM message_recipients WHERE message_id IN ({ph})");
             let recipients_deleted = try_in_tx!(
@@ -12770,14 +13277,32 @@ async fn acknowledge_message_impl(
         let read_params = [Value::BigInt(agent_id), Value::BigInt(message_id)];
         let (read_ts, ack_ts) =
             match map_sql_outcome(traw_query(cx, &tracked, read_sql, &read_params).await) {
-                Outcome::Ok(rows) => {
-                    if rows.is_empty() {
+                Outcome::Ok(rows) if rows.is_empty() => {
+                    // GH#282: a project mailbox delivery records this agent's
+                    // own lazy acknowledgement; other agents stay unacked.
+                    let receipt = try_in_tx!(
+                        cx,
+                        &tracked,
+                        record_project_mailbox_receipt_in_tx(
+                            cx,
+                            &tracked,
+                            agent_id,
+                            message_id,
+                            crate::project_mailbox::ReceiptUpdate::Acknowledge,
+                            now,
+                        )
+                        .await
+                    );
+                    let Some((Some(read_ts), Some(ack_ts))) = receipt else {
                         rollback_tx(cx, &tracked).await;
                         return Outcome::Err(DbError::not_found(
                             "MessageRecipient",
                             format!("{agent_id}:{message_id}"),
                         ));
-                    }
+                    };
+                    (read_ts, ack_ts)
+                }
+                Outcome::Ok(rows) => {
                     let row = rows.first();
                     let read_ts = row.and_then(|r| r.get(0)).and_then(|value| match value {
                         Value::BigInt(n) => Some(*n),
@@ -13965,7 +14490,10 @@ async fn create_file_reservations_impl(
                             "active reservation for project_id={project_id} agent_id={agent_id} path={path} has no id"
                         )));
                     };
-                    row.expires_ts = row.expires_ts.max(now).saturating_add(lease_extension);
+                    // Re-reserving asks for the lease to run at least `ttl`
+                    // from now: keep a later expiry, never stack the TTL on
+                    // what is left (repeat calls would extend without bound).
+                    row.expires_ts = row.expires_ts.max(now.saturating_add(lease_extension));
                     // Re-acquisition applies the new request's intent as well
                     // as its TTL. In particular, shared -> exclusive must not
                     // report a successful acquisition that still lets peers
@@ -14724,23 +15252,10 @@ async fn release_reservations_by_ids_with_constraints(
             Outcome::Panicked(p) => return Outcome::Panicked(p),
         };
         let tracked = tracked(&*conn);
+        // The release ledger is part of the schema (base schema and migration
+        // v14), and every active-reservation read already depends on it, so
+        // the release transaction runs no DDL of its own.
         try_in_tx!(cx, &tracked, begin_immediate_tx(cx, &tracked).await);
-        try_in_tx!(
-            cx,
-            &tracked,
-            map_sql_outcome(
-                traw_execute(
-                    cx,
-                    &tracked,
-                    "CREATE TABLE IF NOT EXISTS file_reservation_releases (\
-                        reservation_id INTEGER PRIMARY KEY,\
-                        released_ts INTEGER NOT NULL\
-                     )",
-                    &[],
-                )
-                .await
-            )
-        );
 
         let mut release_marker = now_micros();
         let mut released = Vec::with_capacity(ids.len());
@@ -23828,6 +24343,125 @@ mod tests {
         );
     }
 
+    /// br-v0ucm: while any concurrent transaction is active FrankenSQLite
+    /// refuses every checkpoint, so an over-limit WAL is only reset if new
+    /// transactions are held off until the in-flight one finishes.
+    #[test]
+    fn over_limit_wal_reset_waits_for_the_in_flight_transaction() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().expect("wal-reset tempdir");
+        let db_path = directory.path().join("wal-reset.sqlite3");
+        let wal_path = directory.path().join("wal-reset.sqlite3-wal");
+        let db_path_str = db_path.to_string_lossy().into_owned();
+        let conn = crate::DbConn::open_file(db_path_str.clone()).expect("open writer");
+        for statement in [
+            "PRAGMA journal_mode = WAL;",
+            "PRAGMA journal_size_limit = 1048576;",
+            "CREATE TABLE bodies(id INTEGER PRIMARY KEY, body TEXT NOT NULL);",
+            "CREATE TABLE holder(id INTEGER PRIMARY KEY, note TEXT NOT NULL);",
+        ] {
+            conn.execute_raw(statement)
+                .expect("prepare wal-reset database");
+        }
+
+        // Another connection keeps a concurrent write transaction open until
+        // told to commit. It writes a different table, so committing it later
+        // never conflicts with the writer's pages.
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder_path = db_path_str.clone();
+        let holder = std::thread::spawn(move || {
+            let holder = crate::DbConn::open_file(holder_path).expect("open holder");
+            holder
+                .execute_raw("BEGIN CONCURRENT;")
+                .expect("holder begins");
+            holder
+                .execute_raw("INSERT INTO holder(note) VALUES ('in flight');")
+                .expect("holder writes");
+            ready_tx.send(()).expect("announce holder");
+            release_rx.recv().expect("await release");
+            holder.execute_raw("COMMIT;").expect("holder commits");
+        });
+        ready_rx.recv().expect("holder transaction open");
+
+        let body = Value::Text("x".repeat(32 * 1024));
+        for _ in 0..64 {
+            conn.execute_sync(
+                "INSERT INTO bodies(body) VALUES (?)",
+                std::slice::from_ref(&body),
+            )
+            .expect("grow the WAL");
+        }
+        conn.execute_raw("PRAGMA busy_timeout = 0;")
+            .expect("fail-fast checkpoints");
+        let rows = conn
+            .query_sync("PRAGMA wal_checkpoint(PASSIVE);", &[])
+            .expect("passive checkpoint");
+        let progress = wal_checkpoint_progress(&rows).expect("checkpoint tuple");
+        assert_eq!(
+            progress.busy, 1,
+            "the engine refuses checkpoints while a concurrent transaction is active: {progress:?}"
+        );
+        assert!(
+            wal_exceeds_journal_size_limit(&conn, progress.log),
+            "64 x 32 KiB bodies must exceed the 1 MiB journal_size_limit: {progress:?}"
+        );
+        assert!(
+            !wal_exceeds_journal_size_limit(&conn, 1),
+            "one frame is under the limit"
+        );
+
+        // A holder that outlives the drain budget: the reset gives up in
+        // bounded time, reopens the gate and backs off.
+        let cx = asupersync::Cx::for_testing();
+        let gate = crate::pool::WalResetGate::new();
+        let started = Instant::now();
+        assert!(
+            !reset_over_limit_wal(&cx, &conn, &gate),
+            "the WAL cannot be truncated under an open transaction"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the reset must stop at its drain budget, took {:?}",
+            started.elapsed()
+        );
+        assert!(!gate.is_closed(), "a failed reset reopens the gate");
+        assert!(
+            gate.try_close().is_none(),
+            "a failed reset defers the next attempt"
+        );
+
+        // The holder finishes while a reset waits: the reset truncates.
+        let gate = crate::pool::WalResetGate::new();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            release_tx.send(()).expect("release holder");
+        });
+        assert!(
+            reset_over_limit_wal(&cx, &conn, &gate),
+            "the reset truncates once the in-flight transaction commits"
+        );
+        assert!(!gate.is_closed(), "a successful reset reopens the gate");
+        releaser.join().expect("releaser thread");
+        holder.join().expect("holder thread");
+        let wal_bytes = std::fs::metadata(&wal_path).map_or(0, |meta| meta.len());
+        assert!(
+            wal_bytes < 64 * 1024,
+            "the WAL must be truncated, still {wal_bytes} bytes"
+        );
+        let rows = conn
+            .query_sync("SELECT count(*) AS count FROM holder", &[])
+            .expect("count holder rows");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get_named::<i64>("count").ok()),
+            Some(1),
+            "the held transaction committed"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn commit_tx_does_not_wait_for_external_reader_checkpoint() {
@@ -26664,6 +27298,162 @@ mod tests {
                     .into_result()
                     .expect("release exact id set");
             assert_eq!(released_ids, vec![second_id]);
+        });
+    }
+
+    #[test]
+    fn numeric_thread_seed_includes_the_seeds_named_thread() {
+        use asupersync::runtime::RuntimeBuilder;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", dir.path().join("seed.db").display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-seed-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let sender = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register sender");
+            let sender_id = sender.id.expect("sender id");
+            let post_in = |thread: Option<&'static str>| {
+                let pool = pool.clone();
+                let cx = cx.clone();
+                async move {
+                    create_message_with_recipients(
+                        &cx,
+                        &pool,
+                        project_id,
+                        sender_id,
+                        "s",
+                        "b",
+                        thread,
+                        "normal",
+                        false,
+                        "[]",
+                        &[(sender_id, "to")],
+                    )
+                    .await
+                    .into_result()
+                    .expect("message")
+                    .id
+                    .expect("id")
+                }
+            };
+            let seed = post_in(Some("TKT-1")).await;
+            let sibling = post_in(Some("TKT-1")).await;
+            let _unrelated = post_in(Some("TKT-2")).await;
+
+            let thread = list_thread_messages(&cx, &pool, project_id, &seed.to_string(), None)
+                .await
+                .into_result()
+                .expect("thread");
+            let mut ids: Vec<i64> = thread.iter().map(|m| m.id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, vec![seed, sibling], "the seed's thread, nothing else");
+        });
+    }
+
+    #[test]
+    fn re_reserving_a_held_path_runs_ttl_from_now_without_stacking() {
+        use asupersync::runtime::RuntimeBuilder;
+        const HOUR: i64 = 3_600_000_000;
+
+        let rt = RuntimeBuilder::current_thread()
+            .build()
+            .expect("build runtime");
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::pool::DbPoolConfig {
+            database_url: format!("sqlite:///{}", dir.path().join("rereserve.db").display()),
+            min_connections: 1,
+            max_connections: 2,
+            run_migrations: true,
+            warmup_connections: 0,
+            ..Default::default()
+        };
+        let pool = crate::create_pool(&cfg).expect("create pool");
+
+        rt.block_on(async {
+            let base = now_micros();
+            let project = ensure_project(&cx, &pool, &format!("/tmp/am-rereserve-{base}"))
+                .await
+                .into_result()
+                .expect("ensure project");
+            let project_id = project.id.expect("project id");
+            let holder = register_agent(
+                &cx,
+                &pool,
+                project_id,
+                "RedFox",
+                "codex-cli",
+                "gpt-5",
+                None,
+                None,
+                None,
+            )
+            .await
+            .into_result()
+            .expect("register holder");
+            let holder_id = holder.id.expect("holder id");
+            let reserve = |ttl: i64| {
+                let pool = pool.clone();
+                let cx = cx.clone();
+                async move {
+                    create_file_reservations(
+                        &cx,
+                        &pool,
+                        project_id,
+                        holder_id,
+                        &["src/a.rs"],
+                        ttl,
+                        true,
+                        "r",
+                    )
+                    .await
+                    .into_result()
+                    .expect("reserve")[0]
+                        .expires_ts
+                }
+            };
+            let first = reserve(3600).await;
+            // A shorter TTL does not cut the lease short, and does not add to it.
+            let short = reserve(60).await;
+            assert_eq!(short, first, "60 s on top of an hour left must not stack");
+            // A longer TTL runs from now (about first + 1 h), not from the
+            // current expiry (first + 2 h).
+            let long = reserve(7200).await;
+            assert!(long >= base + 2 * HOUR, "{long}");
+            assert!(
+                long < first + HOUR * 3 / 2,
+                "7200 s stacked on {first}: {long}"
+            );
         });
     }
 
@@ -29806,6 +30596,7 @@ mod tests {
             .build()
             .expect("build runtime");
         SERIALIZER_LOCKED_AT_PROBE.with(|seen| seen.borrow_mut().clear());
+        SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| seen.borrow_mut().clear());
         rt.block_on(async {
             let cx = Cx::current().expect("runtime installs message test context");
             let project = ensure_project(&cx, &pool, "/tmp/am-serializer-scope")
@@ -29862,6 +30653,18 @@ mod tests {
         assert!(
             seen.iter().any(|locked| !locked),
             "every post-commit probe ran with the message serializer still held: {seen:?}"
+        );
+        // br-qbhs0: the writer's own post-commit sample also runs after the
+        // release; it was ~10% of the serializer's hold under swarm load.
+        let sampled = SERIALIZER_LOCKED_AT_WRITER_SAMPLE.with(|seen| seen.borrow().clone());
+        assert_eq!(
+            sampled.len(),
+            3,
+            "one writer sample per fresh send: {sampled:?}"
+        );
+        assert!(
+            sampled.iter().any(|locked| !locked),
+            "every writer sample ran with the message serializer still held: {sampled:?}"
         );
     }
 
@@ -32553,6 +33356,7 @@ mod tests {
                 false,
                 "[]",
                 &[],
+                None,
             )
             .await
             .into_result()
@@ -33305,6 +34109,7 @@ mod tests {
                 false,
                 "[]",
                 &[(recipient_id, "to")],
+                None,
             )
             .await
             .into_result()

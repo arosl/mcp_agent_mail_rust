@@ -555,6 +555,55 @@ fn fence_contention_report(
     })
 }
 
+/// Contended fence waits in progress: wait sequence number to the wait's start
+/// in µs since the epoch. The oldest start is published as
+/// `storage.archive_fence_wait_since_us`, so a timeout that is still waiting
+/// behind the fence names it instead of reporting an unattributed stall
+/// (br-9bwnb).
+static FENCE_WAITS: Mutex<BTreeMap<u64, u64>> = Mutex::new(BTreeMap::new());
+static FENCE_WAIT_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// One contended fence wait, registered until it drops.
+struct FenceWait {
+    seq: u64,
+}
+
+impl FenceWait {
+    fn begin() -> Self {
+        let seq = FENCE_WAIT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.insert(seq, now_micros_u64());
+        publish_oldest_fence_wait(&waits);
+        Self { seq }
+    }
+}
+
+impl Drop for FenceWait {
+    fn drop(&mut self) {
+        let mut waits = FENCE_WAITS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        waits.remove(&self.seq);
+        publish_oldest_fence_wait(&waits);
+    }
+}
+
+/// The earliest start among `waits`, or zero when none. Sequence order need
+/// not match start order: a wait may take its number, then lose the race for
+/// the map to a later one.
+fn oldest_fence_wait_start(waits: &BTreeMap<u64, u64>) -> u64 {
+    waits.values().copied().min().unwrap_or(0)
+}
+
+fn publish_oldest_fence_wait(waits: &BTreeMap<u64, u64>) {
+    mcp_agent_mail_core::global_metrics()
+        .storage
+        .archive_fence_wait_since_us
+        .set(oldest_fence_wait_start(waits));
+}
+
 /// A held archive publication fence. The holder record is set after the lock
 /// is taken and cleared before it is released, so it is never stale.
 struct FenceLease {
@@ -571,9 +620,11 @@ impl FenceLease {
             Err(std::sync::TryLockError::WouldBlock) => {
                 let blocker = archive_publication_fence_holder();
                 let started = Instant::now();
+                let wait = FenceWait::begin();
                 let guard = ARCHIVE_PUBLICATION_FENCE
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(wait);
                 if let Some(report) =
                     fence_contention_report(started.elapsed(), site, blocker.as_ref())
                 {
@@ -3601,7 +3652,17 @@ fn wbq_execute_op(op: &WriteOp, log_context: &'static str) -> Result<()> {
     // documented (and debug-asserted) not to initiate archive writes. Keep it
     // that way: never acquire the fence from code already holding a
     // per-project archive lock.
-    let _mutation = ArchiveMutationGuard::begin_at(write_op_storage_root(op));
+    //
+    // A reservation op takes no outer window (br-9bwnb): it stages and syncs
+    // its artifacts outside the fence and holds it only to rename them into
+    // place, and it takes no per-project archive lock. Holding the fence
+    // across its fsyncs serialized every agent's reservation behind every
+    // other's, the swarm-scale p99 of ~25 s.
+    let _mutation = if matches!(op, WriteOp::FileReservation { .. }) {
+        None
+    } else {
+        Some(ArchiveMutationGuard::begin_at(write_op_storage_root(op)))
+    };
     let mut attempts = 0;
     loop {
         match wbq_execute_op_inner(op) {
@@ -8066,8 +8127,16 @@ fn archive_storage_root(config: &Config) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const ARCHIVE_GITIGNORE_HEADER: &str = "# Agent Mail runtime artifacts";
-const ARCHIVE_GITIGNORE_ENTRIES: &[&str] =
-    &[".mailbox.activity.lock", "diagnostics/", "search_index/"];
+/// `.tmp-*` covers atomic-write temp files (`atomic_write_tmp_path`): staged
+/// reservation artifacts exist outside the publication fence (br-9bwnb), so a
+/// concurrent `commit_all` must never publish one. No archive name can match
+/// it: thread ids and project slugs never start with a dot.
+const ARCHIVE_GITIGNORE_ENTRIES: &[&str] = &[
+    ".mailbox.activity.lock",
+    "diagnostics/",
+    "search_index/",
+    ".tmp-*",
+];
 
 /// Ensure the global archive root directory exists and is a git repository.
 ///
@@ -8265,6 +8334,12 @@ fn configure_archive_git_defaults(repo: &Repository) {
 ///
 /// Returns `true` if a new repo was created, `false` if it already existed.
 fn ensure_repo(root: &Path, config: &Config) -> Result<bool> {
+    // A cached repo is no mutation: like `ensure_dir`, it must not wait for
+    // the global publication fence (br-9bwnb: every reservation write opens
+    // its archive here before staging outside the fence).
+    if repo_cache_contains(root) {
+        return Ok(false);
+    }
     let _mutation = ArchiveMutationGuard::begin_at(root);
     if repo_cache_contains(root) {
         return Ok(false);
@@ -8481,6 +8556,13 @@ fn build_file_reservation_commit_message(entries: &[(String, String)]) -> String
 }
 
 /// Write file reservation records to the archive and commit.
+///
+/// Every artifact is written and synced under a temp name before the archive
+/// publication fence is taken; the fence covers only the renames that publish
+/// them (br-9bwnb). The fence serializes every archive writer in the process,
+/// so syncing inside it queued each agent's reservation behind every other
+/// agent's. Durability on return is unchanged: the data is synced before the
+/// rename, exactly as `atomic_write_bytes` does it.
 pub fn write_file_reservation_records(
     archive: &ProjectArchive,
     config: &Config,
@@ -8531,7 +8613,9 @@ pub fn write_file_reservation_records(
     let reservation_dir = project_root.join("file_reservations");
     ensure_dir(&reservation_dir)?;
 
+    let mut files = Vec::with_capacity(normalized_reservations.len() * 2);
     for (normalized, path_pattern, agent_name) in normalized_reservations {
+        let content = serde_json::to_string_pretty(&normalized)?.into_bytes();
         // Legacy path: sha1(path_pattern).json
         let digest = {
             let mut hasher = sha1::Sha1::new();
@@ -8539,8 +8623,8 @@ pub fn write_file_reservation_records(
             hex::encode(hasher.finalize())
         };
         let legacy_path = reservation_dir.join(format!("{digest}.json"));
-        write_json(&legacy_path, &normalized, true)?;
         rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &legacy_path)?);
+        files.push((legacy_path, content.clone()));
 
         // Stable per-reservation artifact, keyed by (db_generation, id). The
         // generation token (br-n8qh6) makes the name unique across DB
@@ -8557,12 +8641,13 @@ pub fn write_file_reservation_records(
                     generation, id,
                 ),
             );
-            write_json(&id_path, &normalized, true)?;
             rel_paths.push(rel_path_cached(&archive.canonical_repo_root, &id_path)?);
+            files.push((id_path, content));
         }
 
         entries.push((agent_name, path_pattern));
     }
+    StagedArchiveWrites::stage(files)?.publish()?;
 
     let commit_msg = build_file_reservation_commit_message(&entries);
     enqueue_async_commit(repo_root, config, &commit_msg, &rel_paths);
@@ -13290,9 +13375,73 @@ fn atomic_write_tmp_path(parent: &Path, path: &Path, seq: u64) -> PathBuf {
 /// The temp file is created in the same directory as the target so that
 /// `fs::rename` is guaranteed to be atomic (same filesystem).
 fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
-    use std::io::Write as _;
-
     let _mutation = ArchiveMutationGuard::begin_at(path);
+
+    #[cfg(test)]
+    let _test_guard = atomic_write_test_guard();
+
+    let tmp_path = stage_atomic_write(path, data, sync)?;
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// Archive files written and synced under temp names beside their targets,
+/// then renamed into place together inside one archive mutation window
+/// (br-9bwnb). Staging needs no publication fence: readers only open named
+/// artifacts, and `commit_all` never adds a `.tmp-*` file (gitignored).
+/// Whatever is still staged when this drops is removed.
+struct StagedArchiveWrites {
+    /// `(temp path, target path)` pairs not yet renamed into place.
+    staged: Vec<(PathBuf, PathBuf)>,
+}
+
+impl StagedArchiveWrites {
+    /// Write and `fdatasync` each file under a temp name beside its target.
+    fn stage(files: Vec<(PathBuf, Vec<u8>)>) -> Result<Self> {
+        let mut writes = Self {
+            staged: Vec::with_capacity(files.len()),
+        };
+        for (path, data) in files {
+            let tmp_path = stage_atomic_write(&path, &data, true)?;
+            writes.staged.push((tmp_path, path));
+        }
+        Ok(writes)
+    }
+
+    /// Rename every staged file into place inside one archive mutation window.
+    fn publish(mut self) -> Result<()> {
+        let Some(anchor) = self.staged.first().map(|(_, path)| path.clone()) else {
+            return Ok(());
+        };
+        let _mutation = ArchiveMutationGuard::begin_at(&anchor);
+        let mut pending = std::mem::take(&mut self.staged).into_iter();
+        while let Some((tmp_path, path)) = pending.next() {
+            if let Err(err) = fs::rename(&tmp_path, &path) {
+                let _ = fs::remove_file(&tmp_path);
+                self.staged.extend(pending);
+                return Err(err.into());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedArchiveWrites {
+    fn drop(&mut self) {
+        for (tmp_path, _) in &self.staged {
+            let _ = fs::remove_file(tmp_path);
+        }
+    }
+}
+
+/// Write `data` to a fresh temp file beside `path`, synced when `sync`, and
+/// return the temp path for the caller to rename into place. `create_new`
+/// means a pre-existing file or symlink at a temp name is never clobbered.
+fn stage_atomic_write(path: &Path, data: &[u8], sync: bool) -> Result<PathBuf> {
+    use std::io::Write as _;
 
     #[cfg(test)]
     let _test_guard = atomic_write_test_guard();
@@ -13333,12 +13482,11 @@ fn atomic_write_bytes(path: &Path, data: &[u8], sync: bool) -> Result<()> {
             if sync {
                 f.sync_data()?;
             }
-            fs::rename(&tmp_path, path)?;
             Ok(())
         })();
 
         match result {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(tmp_path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(err) => {
                 // Best-effort cleanup of temp files we created. If the path
@@ -14256,6 +14404,49 @@ mod tests {
     /// publication fence that a draining write-behind batch holds (observed:
     /// inbox reads waiting 25-30 s); a real archive mutation still waits.
     #[test]
+    fn oldest_fence_wait_is_the_earliest_start_not_the_lowest_sequence() {
+        assert_eq!(oldest_fence_wait_start(&BTreeMap::new()), 0);
+        // Wait 7 took its number first but registered after wait 8.
+        let waits = BTreeMap::from([(7, 2_000), (8, 1_000), (9, 3_000)]);
+        assert_eq!(oldest_fence_wait_start(&waits), 1_000);
+    }
+
+    /// br-9bwnb: a thread blocked on the held fence is visible to timeout
+    /// diagnostics while it waits. Without the registration the live wait age
+    /// stays zero and a timed-out reservation reads as unattributed.
+    #[test]
+    fn a_contended_fence_wait_is_visible_to_timeout_diagnostics() {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let waiter = std::thread::spawn(|| drop(ArchiveMutationGuard::begin()));
+
+        let gauge = &mcp_agent_mail_core::global_metrics()
+            .storage
+            .archive_fence_wait_since_us;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while gauge.load() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let waiting = mcp_agent_mail_core::metrics::timeout_diagnostics_snapshot(30_000_000);
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        waiter.join().expect("waiter thread");
+
+        assert!(
+            waiting.archive_fence_wait_us >= 20_000,
+            "a blocked fence wait must have a live age: {waiting:?}"
+        );
+    }
+
+    #[test]
     fn signal_clears_and_cached_dirs_do_not_wait_for_a_held_fence() {
         let tmp = TempDir::new().unwrap();
         let cached_dir = tmp.path().join("cached");
@@ -15022,6 +15213,156 @@ mod tests {
                 "failed reservation batches must not leave partial archive artifacts"
             );
         }
+    }
+
+    fn staged_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .filter(|name| name.starts_with(".tmp-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// br-9bwnb: a reservation write syncs its artifacts outside the archive
+    /// publication fence and takes the fence only to rename them into place.
+    /// While another writer holds the fence the artifacts are staged but not
+    /// visible; once it is released they publish and no temp file remains.
+    #[test]
+    fn reservation_writes_stage_outside_the_fence_and_publish_inside_it() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        // A cached archive and directory are no mutation; warm both first.
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let op = WriteOp::FileReservation {
+            project_slug: "proj".to_string(),
+            config,
+            reservations: vec![serde_json::json!({
+                "id": 7,
+                "agent": "GreenCastle",
+                "path_pattern": "src/**",
+                "exclusive": true,
+            })],
+        };
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = ArchiveMutationGuard::begin();
+            held_tx.send(()).expect("report the held fence");
+            release_rx.recv().expect("wait for release");
+            drop(guard);
+        });
+        held_rx.recv().expect("fence held");
+        let writer = std::thread::spawn(move || wbq_execute_op(&op, "br-9bwnb-test"));
+
+        // The legacy and id artifacts both stage while the fence is held.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut staged = staged_temp_files(&reservation_dir);
+        while staged.len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            staged = staged_temp_files(&reservation_dir);
+        }
+        let id_artifact = reservation_dir.join("id-7.json");
+        let published_while_held = id_artifact.exists();
+        release_tx.send(()).expect("release the fence");
+        holder.join().expect("holder thread");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("reservation write");
+
+        assert_eq!(
+            staged.len(),
+            2,
+            "both artifacts must sync outside the held fence: {staged:?}"
+        );
+        assert!(
+            !published_while_held,
+            "publication must wait for the held fence"
+        );
+        let id_json = fs::read_to_string(&id_artifact).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&id_json).unwrap();
+        assert_eq!(written["path_pattern"], "src/**");
+        let legacy = reservation_dir.join(format!(
+            "{}.json",
+            hex::encode(sha1::Sha1::digest(b"src/**"))
+        ));
+        assert_eq!(fs::read_to_string(legacy).unwrap(), id_json);
+        assert!(
+            staged_temp_files(&reservation_dir).is_empty(),
+            "publication leaves no temp file"
+        );
+    }
+
+    /// br-9bwnb: a staged temp file is no archive state. The overload
+    /// `commit_all` adds the whole worktree; it must never publish a temp file
+    /// another writer staged outside the fence, while the artifact beside it
+    /// is committed. Dropping an unpublished stage removes its temp file.
+    #[test]
+    fn commit_all_never_publishes_a_staged_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(tmp.path());
+        let archive = ensure_archive(&config, "proj").unwrap();
+        let reservation_dir = archive.root.join("file_reservations");
+        ensure_dir(&reservation_dir).unwrap();
+        let staged =
+            StagedArchiveWrites::stage(vec![(reservation_dir.join("id-1.json"), b"{}".to_vec())])
+                .unwrap();
+        fs::write(reservation_dir.join("id-2.json"), "{}").unwrap();
+        assert_eq!(staged_temp_files(&reservation_dir).len(), 1);
+
+        let repo = Repository::open(&archive.repo_root).unwrap();
+        commit_all(&repo, &config, "overload snapshot").unwrap();
+
+        let committed = repo
+            .head()
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .get_path(Path::new("projects/proj/file_reservations"))
+            .unwrap()
+            .to_object(&repo)
+            .unwrap()
+            .peel_to_tree()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.name().ok().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(committed, ["id-2.json"]);
+        drop(staged);
+        assert!(staged_temp_files(&reservation_dir).is_empty());
+    }
+
+    /// A failed publication stops at the failing rename and removes every
+    /// temp file it still owns.
+    #[test]
+    fn staged_archive_writes_clean_up_after_a_failed_publication() {
+        let tmp = TempDir::new().unwrap();
+        // A file cannot be renamed over a non-empty directory.
+        let blocked = tmp.path().join("blocked.json");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "keep").unwrap();
+        let later = tmp.path().join("later.json");
+        let staged = StagedArchiveWrites::stage(vec![
+            (blocked.clone(), b"{}".to_vec()),
+            (later.clone(), b"{}".to_vec()),
+        ])
+        .unwrap();
+        assert_eq!(staged_temp_files(tmp.path()).len(), 2);
+
+        staged
+            .publish()
+            .expect_err("a rename over a non-empty directory fails");
+
+        assert!(staged_temp_files(tmp.path()).is_empty());
+        assert_eq!(fs::read_to_string(blocked.join("keep")).unwrap(), "keep");
+        assert!(!later.exists(), "publication stops at the failed rename");
     }
 
     #[test]
@@ -15954,6 +16295,10 @@ mod tests {
         let outside = outside_tmp.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
 
+        // Production order: the fence before the test lock. Holding only the
+        // test lock here while `write_text` waits on the fence would deadlock
+        // against a concurrent atomic write that holds the fence.
+        let _mutation = ArchiveMutationGuard::begin();
         let _guard = atomic_write_test_guard();
         ATOMIC_WRITE_TMP_COUNTER.store(0, Ordering::Relaxed);
         for seq in 0..8 {

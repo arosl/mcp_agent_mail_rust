@@ -36,6 +36,7 @@ static SKIP_NEXT_PROACTIVE_BACKUP: AtomicBool = AtomicBool::new(false);
 static WORKER: std::sync::LazyLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     std::sync::LazyLock::new(|| Mutex::new(None));
 
+#[cfg(test)]
 const DEFAULT_QUICK_CHECK_INTERVAL_SECS: u64 = 300;
 const MIN_FULL_CHECK_INTERVAL_SECS: u64 = 3600;
 const RECOVERY_MIN_INTERVAL_SECS: u64 = 30;
@@ -152,8 +153,8 @@ fn recovery_availability_note(sqlite_path: &Path) -> String {
 }
 
 #[inline]
-const fn quick_check_interval() -> Duration {
-    Duration::from_secs(DEFAULT_QUICK_CHECK_INTERVAL_SECS)
+fn quick_check_interval(config: &Config) -> Duration {
+    Duration::from_secs(config.integrity_quick_check_interval_seconds.max(1))
 }
 
 #[inline]
@@ -215,7 +216,7 @@ fn resolve_integrity_guard_sqlite_path(config: &Config) -> Option<PathBuf> {
 /// backup's age by the server's settings, not the CLI's environment.
 #[must_use]
 pub fn enabled_for(config: &Config) -> bool {
-    config.integrity_check_on_startup && !is_sqlite_memory_database_url(&config.database_url)
+    config.integrity_guard_enabled && !is_sqlite_memory_database_url(&config.database_url)
 }
 
 pub fn start(config: &Config) {
@@ -276,7 +277,7 @@ pub fn shutdown() {
 }
 
 fn monitor_loop(config: &Config, sqlite_path: &Path) {
-    let quick_every = quick_check_interval();
+    let quick_every = quick_check_interval(config);
     let full_every = full_check_interval(config);
     let storage_root = config.storage_root.clone();
 
@@ -321,6 +322,32 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
     let mut last_atc_retention: Option<Instant> = Some(maintenance_start);
     let mut last_doctor_retention: Option<Instant> = Some(maintenance_start);
     let mut skip_first_quick_cycle = SKIP_NEXT_QUICK_CYCLE.swap(false, Ordering::AcqRel);
+
+    // Skipping the boot probe must not disable this worker or secretly move
+    // the same expensive probe onto the startup background path. Its first
+    // real cycle is due one normal quick-check interval after worker startup.
+    let initial_delay = if config.integrity_check_on_startup {
+        Duration::ZERO
+    } else {
+        skip_first_quick_cycle = false;
+        quick_every
+    };
+    let first_due_us = u64::try_from(mcp_agent_mail_db::now_micros())
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(initial_delay.as_micros()).unwrap_or(u64::MAX));
+    mcp_agent_mail_core::global_metrics()
+        .db
+        .integrity_guard_first_check_due_us
+        .set(first_due_us);
+    let _schedule = IntegrityGuardSchedule;
+    tracing::info!(
+        startup_check_enabled = config.integrity_check_on_startup,
+        first_check_due_us = first_due_us,
+        "integrity guard scheduled its first background cycle"
+    );
+    if !wait_for_next_cycle(initial_delay) {
+        return;
+    }
 
     loop {
         if SHUTDOWN.load(Ordering::Acquire) {
@@ -422,18 +449,35 @@ fn monitor_loop(config: &Config, sqlite_path: &Path) {
             );
         }
 
-        // Sleep in short increments so shutdown reacts quickly.
-        let mut remaining = quick_every;
-        while !remaining.is_zero() {
-            if SHUTDOWN.load(Ordering::Acquire) {
-                tracing::info!("integrity guard worker shutting down");
-                return;
-            }
-            let chunk = remaining.min(Duration::from_secs(1));
-            std::thread::sleep(chunk);
-            remaining = remaining.saturating_sub(chunk);
+        if !wait_for_next_cycle(quick_every) {
+            return;
         }
     }
+}
+
+/// A stopped or failed worker must not leave a promised future check in health.
+struct IntegrityGuardSchedule;
+
+impl Drop for IntegrityGuardSchedule {
+    fn drop(&mut self) {
+        mcp_agent_mail_core::global_metrics()
+            .db
+            .integrity_guard_first_check_due_us
+            .set(0);
+    }
+}
+
+fn wait_for_next_cycle(mut remaining: Duration) -> bool {
+    while !remaining.is_zero() {
+        if SHUTDOWN.load(Ordering::Acquire) {
+            tracing::info!("integrity guard worker shutting down");
+            return false;
+        }
+        let chunk = remaining.min(Duration::from_secs(1));
+        std::thread::sleep(chunk);
+        remaining = remaining.saturating_sub(chunk);
+    }
+    !SHUTDOWN.load(Ordering::Acquire)
 }
 
 /// Run mutating followups only after all required integrity verdicts pass.
@@ -1024,12 +1068,11 @@ fn run_db_maintenance_cycle(
         *last_atc_retention = Some(now);
     }
 
-    // br-mudrv: bound doctor recovery-debris growth across recovery events.
-    // OBSERVE + ALERT only — the forensic-bundle manifest declares
-    // `automatic_deletion: false` and RULE 1 forbids automatic deletion, so the
-    // actual reclaim is the explicit `am doctor reclaim` operator verb. Here we
-    // surface (warn) when the reclaimable debris exceeds the configured
-    // threshold so the growth that silently reached ~19 GB in prod is visible.
+    // br-mudrv / br-kp1in.36: OBSERVE + ALERT only. Evidence already staged
+    // for reclaim, direct backups and retained proactive exports still occupy
+    // disk even when the reclaim planner would move nothing. Use the same
+    // full footprint and alarm policy as the native health surfaces. This
+    // never authorizes deletion, reclamation, or bypassing backup admission.
     if config.doctor_retention_enabled
         && maintenance_task_due(
             config.doctor_retention_sweep_interval_secs,
@@ -1037,46 +1080,56 @@ fn run_db_maintenance_cycle(
             now,
         )
     {
-        let artifacts = mcp_agent_mail_db::recovery_retention::enumerate_recovery_debris(
-            &config.storage_root,
-            sqlite_path,
-        );
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|d| i64::try_from(d.as_micros()).ok())
             .unwrap_or(0);
         let live_database_bytes = std::fs::metadata(sqlite_path).map_or(0, |meta| meta.len());
-        let plan = mcp_agent_mail_db::recovery_retention::select_recovery_debris_to_reclaim(
-            artifacts,
-            mcp_agent_mail_db::recovery_retention::RetentionPolicy {
-                keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
-                max_age_secs: config.doctor_retention_max_age_secs,
-                max_total_bytes_per_category:
-                    mcp_agent_mail_db::recovery_retention::effective_byte_budget_per_category(
-                        config.doctor_retention_max_bytes_per_category,
-                        live_database_bytes,
-                    ),
-            },
-            now_us,
-        );
-        if config.doctor_retention_alert_bytes > 0
-            && plan.reclaimable_bytes >= config.doctor_retention_alert_bytes
-        {
-            tracing::warn!(
-                reclaimable_bytes = plan.reclaimable_bytes,
-                reclaimable_artifacts = plan.prune.len(),
-                total_bytes = plan.total_bytes,
-                total_artifacts = plan.total_count,
-                alert_bytes = config.doctor_retention_alert_bytes,
-                "doctor recovery debris exceeds retention threshold; run `am doctor reclaim` to consolidate (br-mudrv)"
-            );
-        } else if plan.has_reclaimable() {
-            tracing::debug!(
-                reclaimable_bytes = plan.reclaimable_bytes,
-                reclaimable_artifacts = plan.prune.len(),
-                "doctor recovery debris reclaimable but under alert threshold"
-            );
+        let policy = mcp_agent_mail_db::recovery_retention::RetentionPolicy {
+            keep_min: usize::try_from(config.doctor_retention_keep_min).unwrap_or(usize::MAX),
+            max_age_secs: config.doctor_retention_max_age_secs,
+            max_total_bytes_per_category:
+                mcp_agent_mail_db::recovery_retention::effective_byte_budget_per_category(
+                    config.doctor_retention_max_bytes_per_category,
+                    live_database_bytes,
+                ),
+        };
+        match mcp_agent_mail_db::recovery_retention::retention_resident_stats(
+            &config.storage_root,
+            sqlite_path,
+            Some((policy, now_us)),
+        ) {
+            Ok(stats) => {
+                let resident_attention =
+                    stats.resident_attention(config.doctor_retention_alert_bytes);
+                let reclaimable_attention =
+                    stats.reclaimable_attention(config.doctor_retention_alert_bytes);
+                if resident_attention || reclaimable_attention {
+                    tracing::warn!(
+                        resident_bytes = stats.resident_bytes,
+                        live_database_bytes = ?stats.live_database_bytes,
+                        resident_bytes_by_category = ?stats.resident_bytes_by_category,
+                        reclaimable_bytes = stats.reclaimable_bytes,
+                        reclaimable_staging_bytes = stats.reclaimable_staging_bytes,
+                        resident_attention,
+                        reclaimable_attention,
+                        alert_bytes = config.doctor_retention_alert_bytes,
+                        "retained recovery evidence exceeds its health threshold; inspect `am doctor health` and `am doctor reclaim --dry-run`; consolidation preserves evidence and does not free disk (br-kp1in.36)"
+                    );
+                } else if stats.reclaimable_bytes > 0 {
+                    tracing::debug!(
+                        resident_bytes = stats.resident_bytes,
+                        reclaimable_bytes = stats.reclaimable_bytes,
+                        "doctor recovery debris reclaimable but under alert threshold"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %error,
+                path = %sqlite_path.display(),
+                "retention footprint unavailable; no empty or healthy inventory inferred; evidence preserved (br-kp1in.36)"
+            ),
         }
         *last_doctor_retention = Some(now);
     }
@@ -1187,6 +1240,130 @@ fn handle_integrity_error_with_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exercise_startup_skip(maintenance: bool) {
+        // The actual worker, integrity evidence and maintenance counters are
+        // process-global. Run this exact regression in its own libtest child.
+        const CHILD: &str = "AM_TEST_INTEGRITY_PERIODIC_CHILD";
+        let thread = std::thread::current();
+        let name = thread.name().expect("named libtest thread");
+        if std::env::var(CHILD).as_deref() != Ok(name) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, name)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "isolated {name} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        mcp_agent_mail_core::config::with_isolated_default_storage_root_and_env_overrides_for_test(
+            &[
+                ("DATABASE_URL", ""),
+                ("INTEGRITY_CHECK_ON_STARTUP", "false"),
+                ("INTEGRITY_GUARD_ENABLED", "true"),
+                ("INTEGRITY_QUICK_CHECK_INTERVAL_SECONDS", "1"),
+                ("INTEGRITY_CHECK_INTERVAL_HOURS", "1"),
+                (
+                    "DB_MAINTENANCE_ENABLED",
+                    if maintenance { "true" } else { "false" },
+                ),
+                ("DB_CHECKPOINT_INTERVAL_SECS", "1"),
+                ("DB_ANALYZE_INTERVAL_SECS", "0"),
+                ("DB_VACUUM_INTERVAL_SECS", "0"),
+            ],
+            |root| {
+                std::fs::create_dir_all(root).unwrap();
+                let mut config = Config::from_env();
+                let path = root.join("periodic.sqlite3");
+                config.database_url = mcp_agent_mail_core::disk::sqlite_url_from_path(&path);
+                let conn =
+                    mcp_agent_mail_db::CanonicalDbConn::open_file(path.to_str().unwrap()).unwrap();
+                conn.execute_raw(&mcp_agent_mail_db::schema::init_schema_sql_base())
+                    .unwrap();
+                conn.query_sync("PRAGMA wal_checkpoint(TRUNCATE)", &[])
+                    .unwrap();
+                drop(conn);
+                assert_eq!(
+                    mcp_agent_mail_db::integrity::integrity_metrics().checks_total,
+                    0
+                );
+                let started_us = mcp_agent_mail_db::now_micros();
+                start(&config);
+                struct StopWorker;
+                impl Drop for StopWorker {
+                    fn drop(&mut self) {
+                        shutdown();
+                    }
+                }
+                let stop = StopWorker;
+                let db = &mcp_agent_mail_core::global_metrics().db;
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while db.integrity_guard_first_check_due_us.load() == 0 && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let first_due = db.integrity_guard_first_check_due_us.load();
+                assert!(first_due >= u64::try_from(started_us).unwrap() + 1_000_000);
+                let snapshot = mcp_agent_mail_db::snapshot::snapshot_meta_path(&path);
+                loop {
+                    let evidence = mcp_agent_mail_db::integrity::integrity_metrics();
+                    if evidence.last_full_check_outcome
+                        == mcp_agent_mail_db::IntegrityCheckOutcome::Passed
+                        && snapshot.is_file()
+                        && (!maintenance || db.maintenance_checkpoint_runs_total.load() > 0)
+                    {
+                        assert!(evidence.last_full_check_ts >= i64::try_from(first_due).unwrap());
+                        assert_eq!(evidence.failures_since_last_ok, 0);
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "periodic worker did not finish: {evidence:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                drop(stop);
+                assert_eq!(db.integrity_guard_first_check_due_us.load(), 0);
+                assert_eq!(db.maintenance_checkpoint_runs_total.load() > 0, maintenance);
+                assert_eq!(db.maintenance_analyze_runs_total.load(), 0);
+                assert_eq!(db.maintenance_vacuum_runs_total.load(), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn skipped_startup_still_runs_real_periodic_checks_backups_and_maintenance() {
+        exercise_startup_skip(true);
+    }
+
+    #[test]
+    fn disabled_maintenance_preserves_real_periodic_checks_and_backups() {
+        exercise_startup_skip(false);
+    }
+
+    #[test]
+    fn guard_enablement_is_independent_of_startup_and_maintenance() {
+        let mut config = Config {
+            database_url: "sqlite:///explicit-mailbox.sqlite3".to_string(),
+            integrity_check_on_startup: false,
+            db_maintenance_enabled: false,
+            ..Config::default()
+        };
+        assert!(enabled_for(&config));
+        config.integrity_guard_enabled = false;
+        assert!(!enabled_for(&config));
+        config.integrity_check_on_startup = true;
+        assert!(!enabled_for(&config));
+        config.integrity_guard_enabled = true;
+        config.database_url = "sqlite:///:memory:".to_string();
+        assert!(!enabled_for(&config));
+    }
 
     fn hard_live_integrity_error() -> mcp_agent_mail_db::DbError {
         mcp_agent_mail_db::DbError::IntegrityCorruption {
@@ -1840,7 +2017,7 @@ mod tests {
     #[test]
     fn quick_interval_matches_default() {
         assert_eq!(
-            quick_check_interval(),
+            quick_check_interval(&Config::default()),
             Duration::from_secs(DEFAULT_QUICK_CHECK_INTERVAL_SECS)
         );
     }
@@ -1877,7 +2054,7 @@ mod tests {
 
     #[test]
     fn quick_check_interval_is_5_minutes() {
-        assert_eq!(quick_check_interval().as_secs(), 300);
+        assert_eq!(quick_check_interval(&Config::default()).as_secs(), 300);
     }
 
     #[test]

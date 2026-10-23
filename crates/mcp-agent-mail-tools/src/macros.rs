@@ -25,7 +25,10 @@ use crate::llm;
 use crate::messaging::InboxMessage;
 use crate::reservations::ReservationResponse;
 use crate::search::{ExampleMessage, ThreadSummary};
-use crate::tool_util::{db_outcome_to_mcp_result, get_db_pool, legacy_tool_error, resolve_project};
+use crate::tool_util::{
+    db_outcome_to_mcp_result, get_coalescer_bypass_read_db_pool, get_db_pool, legacy_tool_error,
+    resolve_agent, resolve_existing_project, resolve_project, tool_error_code,
+};
 use mcp_agent_mail_db::micros_to_iso;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -92,6 +95,11 @@ pub const WELCOME_SKIPPED_CONTACT_PENDING: &str = "contact_not_approved: the wel
 pub const WELCOME_SKIPPED_CONTACT_BLOCKED: &str = "contact_blocked: the target has blocked \
      contact from this requester; auto_accept does not override a block, so the link stays \
      blocked and no welcome was sent (only the target can unblock it with respond_contact)";
+
+/// Reason reported when only one of `welcome_subject` / `welcome_body` was
+/// given: a welcome needs both, and it is not sent half-written.
+pub const WELCOME_SKIPPED_INCOMPLETE: &str = "welcome_incomplete: a welcome needs both \
+     welcome_subject and welcome_body; only one was given, so no welcome was sent";
 
 fn parse_json<T: DeserializeOwned>(payload: String, label: &str) -> McpResult<T> {
     serde_json::from_str(&payload)
@@ -375,7 +383,10 @@ pub async fn macro_prepare_thread(
 
     let should_register = register_if_missing.unwrap_or(true);
     let agent = if should_register {
-        let agent_json = crate::identity::register_agent(
+        // Refresh (or create) the profile as register_agent does, but leave a
+        // running agent's registration token alone: rotating it here would
+        // make that agent's next verified send fail with a token mismatch.
+        let agent_json = crate::identity::register_agent_with_token_policy(
             ctx,
             project.human_key.clone(),
             program,
@@ -387,6 +398,7 @@ pub async fn macro_prepare_thread(
             None,
             None,
             registration_proof,
+            crate::identity::TokenPolicy::KeepExisting,
         )
         .await?;
         parse_json(agent_json, "agent")?
@@ -501,7 +513,15 @@ pub async fn macro_prepare_thread(
     }
     tracing::debug!("Inbox limit: {}", inbox_limit);
 
-    serde_json::to_string(&response)
+    let mut value = serde_json::to_value(&response)
+        .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))?;
+    // The agent object always carries `registration_token`, as the Python
+    // response did; a token this call kept (or did not mint) is null, never
+    // the running agent's credential.
+    if let Some(agent) = value.get_mut("agent").and_then(Value::as_object_mut) {
+        agent.entry("registration_token").or_insert(Value::Null);
+    }
+    serde_json::to_string(&value)
         .map_err(|e| McpError::internal_error(format!("JSON serialization error: {e}")))
 }
 
@@ -695,8 +715,81 @@ pub async fn macro_contact_handshake(
         mcp_agent_mail_core::models::normalize_agent_name(&target_agent).unwrap_or(target_agent);
     let target_resolution =
         crate::contacts::resolve_contact_target(&target_agent, to_project.as_deref(), &project_key);
+    let should_auto_accept = auto_accept.unwrap_or(false);
+
+    // A handshake has two actors when it auto-accepts: the requester and the
+    // recipient deciding the link. Check both on the read-only lane before
+    // implicit registration, project creation, link refresh, or intro mail.
+    // A project in which this session holds no identity keeps trusted-local
+    // behavior, just as each granular contact tool does.
+    if !crate::session_identity::session_bindings(ctx).is_empty() {
+        let read_pool = get_coalescer_bypass_read_db_pool()?;
+        match resolve_existing_project(ctx, &read_pool, &project_key).await {
+            Ok(project) => {
+                let project_id = project.id.unwrap_or(0);
+                match resolve_agent(
+                    ctx,
+                    &read_pool,
+                    project_id,
+                    &from_agent,
+                    &project.slug,
+                    &project.human_key,
+                )
+                .await
+                {
+                    Ok(agent) => crate::session_identity::authorize_actor(
+                        ctx,
+                        &agent,
+                        false,
+                        "request contacts",
+                    )?,
+                    Err(error)
+                        if register_if_missing != Some(false)
+                            && tool_error_code(&error) == Some("NOT_FOUND") =>
+                    {
+                        crate::contacts::authorize_requester_creation(
+                            ctx,
+                            project_id,
+                            &from_agent,
+                        )?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error)
+                if register_if_missing != Some(false)
+                    && tool_error_code(&error) == Some("NOT_FOUND") => {}
+            Err(error) => return Err(error),
+        }
+        if should_auto_accept {
+            let project =
+                resolve_existing_project(ctx, &read_pool, &target_resolution.project_key).await?;
+            let target = resolve_agent(
+                ctx,
+                &read_pool,
+                project.id.unwrap_or(0),
+                &target_resolution.agent_name,
+                &project.slug,
+                &project.human_key,
+            )
+            .await?;
+            crate::session_identity::authorize_actor(
+                ctx,
+                &target,
+                false,
+                "respond to contact requests",
+            )?;
+        }
+    }
+
     let pool = get_db_pool()?;
-    let source_project = resolve_project(ctx, &pool, &project_key).await?;
+    // register_if_missing=false means nothing is created implicitly: a missing
+    // source project is NOT_FOUND here, before the contact flow's own check.
+    let source_project = if register_if_missing == Some(false) {
+        resolve_existing_project(ctx, &pool, &project_key).await?
+    } else {
+        resolve_project(ctx, &pool, &project_key).await?
+    };
     let source_project_key = source_project.human_key.clone();
     let target_project = resolve_project(ctx, &pool, &target_resolution.project_key).await?;
     let target_project_key = target_project.human_key.clone();
@@ -705,7 +798,6 @@ pub async fn macro_contact_handshake(
             .unwrap_or_else(|| target_resolution.agent_name.clone());
     let is_cross_project = source_project.id != target_project.id;
 
-    let should_auto_accept = auto_accept.unwrap_or(false);
     let ttl = match ttl_seconds {
         Some(t) if t > 0 => t.clamp(60, 31_536_000), // consistent with other macros
         _ => 604_800,                                // 7 days
@@ -842,7 +934,11 @@ pub async fn macro_contact_handshake(
                 Err(error) => return Err(error),
             }
         }
-        _ => None,
+        (Some(_), None) | (None, Some(_)) => {
+            welcome_skipped_reason = Some(WELCOME_SKIPPED_INCOMPLETE.to_string());
+            None
+        }
+        (None, None) => None,
     };
 
     let welcome_sent = welcome_val.is_some();
@@ -1456,6 +1552,7 @@ mod tests {
                 read_ts: None,
                 ack_ts: None,
                 kind: "direct".into(),
+                via: None,
                 attachments: Vec::new(),
                 body_md: Some("Body text".into()),
             }],
