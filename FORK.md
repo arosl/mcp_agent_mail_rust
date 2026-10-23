@@ -73,6 +73,12 @@ Tests:
 | `crates/mcp-agent-mail-cli/src/lib.rs` | the self-update fallback hint names the fork's `herdr` installer |
 | `FORK.md` | this file |
 
+The bead queue:
+
+| Where | Upstream | The fork |
+|---|---|---|
+| `.beads/` | tracked | not tracked, except its `.gitignore`, which ignores everything. The files stay on disk, and the fork's own work is tracked in this checkout's br. br writes the local user name and checkout path into every exported bead, and the fork is public (the ACFS operator, 2026-10-14). Not part of a release |
+
 ## Branches
 
 `herdr` is the fork's release line and its default branch: upstream's

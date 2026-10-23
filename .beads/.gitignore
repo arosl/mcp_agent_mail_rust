@@ -1,21 +1,3 @@
-# Database
-*.db
-*.db-shm
-*.db-wal
-
-# Lock files
-*.lock
-
-# Temporary
-last-touched
-*.tmp
-
-# br fsqlite-ns VFS sidecars — per-machine runtime state, like -wal/-shm.
-# Covers beads.db-fsqlite-ns-{gate,use} and vacuum copies named
-# .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
-*-fsqlite-ns-gate
-*-fsqlite-ns-use
-
-# Merge artifacts (temporary files from 3-way merge)
-beads.base.jsonl
-beads.base.meta.json
+# The fork keeps its bead queue local: br writes the local user name and
+# checkout path into every bead, and this fork is public (operator, 2026-10-14).
+*
