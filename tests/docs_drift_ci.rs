@@ -546,7 +546,8 @@ mod dist_release_contract {
             "LINUX_GLIBC_FLOOR: '2.28'",
             "version: 0.14.1",
             "cargo install --locked --version \"$CARGO_ZIGBUILD_VERSION\" cargo-zigbuild",
-            "actual_version=\"$(cargo zigbuild --version)\"",
+            // Fork (FORK.md): cargo-zigbuild 0.23.3 rejects `cargo zigbuild --version`.
+            "actual_version=\"$(cargo-zigbuild --version)\"",
             "cargo zigbuild --locked --release --target \"${target}.${LINUX_GLIBC_FLOOR}\"",
             "cargo build --locked --release --target \"$target\"",
             "  linux_portability:",
@@ -920,7 +921,7 @@ mod dist_release_contract {
             ]
             .iter()
             .any(|command| line.contains(command))
-                && !line.contains("cargo zigbuild --version")
+                && !line.contains("cargo-zigbuild --version")
                 && !line.contains("--locked")
             {
                 return Err(format!("release Cargo command is not locked: {line}"));

@@ -371,7 +371,9 @@ jobs:
         run: |
           set -euo pipefail
           cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
-          actual_version="$(cargo zigbuild --version)"
+          # Fork (FORK.md): cargo-zigbuild 0.23.3 takes --version only when
+          # run as its own binary, not as a cargo subcommand.
+          actual_version="$(cargo-zigbuild --version)"
           if [ "$actual_version" != "cargo-zigbuild ${CARGO_ZIGBUILD_VERSION}" ]; then
             echo "cargo-zigbuild version mismatch: ${actual_version}" >&2
             exit 1
@@ -386,6 +388,8 @@ jobs:
         # (ONNX Runtime ships AVX2-only static libs → SIGILL on older x86 CPUs).
         # Portable keeps s3fifo + tantivy-engine; hybrid can still be enabled
         # by users who build from source with default features.
+        # Fork (FORK.md): bash on every runner; Windows defaults to pwsh.
+        shell: bash
         env:
           # Statically link glibc-free musl builds so the binary runs on any
           # x86_64 Linux regardless of host libc. Leaves other targets alone.
