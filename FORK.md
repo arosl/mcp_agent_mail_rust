@@ -57,7 +57,7 @@ Installer, updates and version:
 | `install.sh` usage comments | upstream's one-liner | the fork's `herdr` branch installer |
 | CLI self-update (`am self-update`, `am update`) and its "update available" check | upstream's releases | the fork's releases, so an update never replaces the fork with upstream. The fork's releases carry no minisign signature, so self-update refuses them: update through the installer (ACFS: its pinned one) |
 | CLI update hints, the self-update fallback hint, core `AM_INSTALL_REPAIR_COMMAND` | upstream's installer | the fork's `herdr` branch installer |
-| `Cargo.toml` `workspace.package.version`, `Cargo.lock` | `0.3.39` | `0.3.39-herdr.1`, the fork's release version (see Releases) |
+| `Cargo.toml` `workspace.package.version`, `Cargo.lock` | `0.3.39` | `0.3.39-herdr.2`, the fork's release version (see Releases) |
 
 Not changed, on purpose: `install.ps1` (Windows; ACFS does not use it), and
 `COSIGN_IDENTITY` (used only for upstream's releases before v0.3.31). The
@@ -91,7 +91,7 @@ cut the next fork release.
 ## Releases
 
 The fork tags `v<upstream version>-herdr.<n>` (for example
-`v0.3.39-herdr.1`) on `herdr`, after the commit that sets that version in
+`v0.3.39-herdr.2`) on `herdr`, after the commit that sets that version in
 `Cargo.toml` and in `install.sh`'s `FORK_PINNED_VERSION`.
 
 Only `dist.yml` is enabled on the fork; every other workflow is disabled,
@@ -100,7 +100,7 @@ fork starts no run at all (tried twice for `v0.3.38-herdr.1`, which has no
 release), so a release is dispatched on its tag. The tagged commit's
 `dist.yml` must have the dispatch trigger:
 
-    gh workflow run dist.yml -R arosl/mcp_agent_mail_rust --ref v0.3.39-herdr.1
+    gh workflow run dist.yml -R arosl/mcp_agent_mail_rust --ref v0.3.39-herdr.2
 
 The run builds the six targets, signs them with the workflow's keyless
 Sigstore identity, stages the 30 assets in a draft, verifies the draft and
