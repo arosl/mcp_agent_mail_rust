@@ -303,6 +303,12 @@ jobs:
     timeout-minutes: 180
 
     steps:
+      # Fork (FORK.md): a hosted Linux runner was shut down mid-build (run
+      # 40025131151, musl), so the build frees disk first, as the test job does.
+      - name: Free runner disk space
+        if: runner.os == 'Linux'
+        run: df -h / && sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
@@ -394,6 +400,9 @@ jobs:
           # Statically link glibc-free musl builds so the binary runs on any
           # x86_64 Linux regardless of host libc. Leaves other targets alone.
           RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=+crt-static' || '' }}
+          # Fork (FORK.md): two rustc jobs at a time, so the thin-LTO,
+          # one-codegen-unit release build of the large crates fits a hosted runner.
+          CARGO_BUILD_JOBS: "2"
         run: |
           set -euo pipefail
           target='${{ matrix.target }}'
