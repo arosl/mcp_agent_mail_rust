@@ -1120,7 +1120,14 @@ jobs:
             exit 1
           fi
 
-          releases_json="$(list_matching_releases)"
+          # Fork (FORK.md): the release list showed no draft 3 s after
+          # the create (run 40087115862), so an empty list is read again,
+          # for up to a minute.
+          for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            releases_json="$(list_matching_releases)"
+            [ "$(jq -r 'length' <<< "$releases_json")" -eq 0 ] || break
+            sleep 5
+          done
           if [ "$(jq -r 'length' <<< "$releases_json")" -ne 1 ]; then
             echo "Expected exactly one draft after preflight" >&2
             exit 1
