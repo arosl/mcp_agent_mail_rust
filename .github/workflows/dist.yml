@@ -309,6 +309,12 @@ jobs:
         if: runner.os == 'Linux'
         run: df -h / && sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
 
+      # Fork (FORK.md): all three Linux build runners were shut down mid-build
+      # again with disk to spare (run 40044222539), so they get 16G of swap.
+      - name: Add swap
+        if: runner.os == 'Linux'
+        run: sudo fallocate -l 16G /acfs-swapfile && sudo chmod 600 /acfs-swapfile && sudo mkswap /acfs-swapfile && sudo swapon /acfs-swapfile && free -m
+
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ needs.release_contract.outputs.revision }}
@@ -406,6 +412,12 @@ jobs:
         run: |
           set -euo pipefail
           target='${{ matrix.target }}'
+          # Fork (FORK.md): memory every 60 s, so a runner lost mid-build
+          # leaves its last reading in this log.
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            (while sleep 60; do echo "memory: $(free -m | awk 'NR==2 {print $3"M used, "$7"M available"}; NR==3 {print "swap "$3"M used"}' | paste -sd' ')"; done) &
+            trap 'kill $! 2>/dev/null; :' EXIT
+          fi
           if [[ "$target" == *-unknown-linux-gnu ]]; then
             cargo zigbuild --locked --release --target "${target}.${LINUX_GLIBC_FLOOR}" -p mcp-agent-mail -p mcp-agent-mail-cli --no-default-features --features portable
           else
