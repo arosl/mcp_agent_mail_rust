@@ -823,6 +823,8 @@ jobs:
             echo "Workflow identity ${GITHUB_WORKFLOW_REF_VALUE} does not match ${expected_workflow_ref}" >&2
             exit 1
           fi
+          # Fork (FORK.md): the fork's releases run by dispatch, and the
+          # signing certificate names the run's trigger.
           expected_certificate_identity="https://github.com/${expected_workflow_ref}"
           signed_subjects=("${expected_payloads[@]}" SHA256SUMS)
           for subject in "${signed_subjects[@]}"; do
@@ -838,7 +840,7 @@ jobs:
                 --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
                 --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
                 --certificate-github-workflow-sha "$EXPECTED_REVISION" \
-                --certificate-github-workflow-trigger "push" \
+                --certificate-github-workflow-trigger "workflow_dispatch" \
                 "$subject"
             )
           done
@@ -976,6 +978,8 @@ jobs:
             fi
           done
 
+          # Fork (FORK.md): the fork's releases run by dispatch, and the
+          # signing certificate names the run's trigger.
           expected_certificate_identity="https://github.com/${EXPECTED_REPOSITORY}/.github/workflows/dist.yml@refs/tags/${RELEASE_TAG}"
           cd publish
           for subject in "${signed_subjects[@]}"; do
@@ -989,7 +993,7 @@ jobs:
                 --certificate-github-workflow-repository "$EXPECTED_REPOSITORY" \
                 --certificate-github-workflow-ref "refs/tags/${RELEASE_TAG}" \
                 --certificate-github-workflow-sha "$EXPECTED_REVISION" \
-                --certificate-github-workflow-trigger "push" \
+                --certificate-github-workflow-trigger "workflow_dispatch" \
                 "$subject"
             )
           done

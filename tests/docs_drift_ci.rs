@@ -677,7 +677,8 @@ mod dist_release_contract {
             "if: ${{ startsWith(github.ref, 'refs/tags/v') }}",
             2,
         )?;
-        require_exactly(workflow, "workflow_dispatch", 1)?;
+        // Fork (FORK.md): the trigger once; the cosign checks name it too.
+        require_exactly(workflow, "workflow_dispatch:", 1)?;
         // Fork (FORK.md): 20 with the test job's "Free runner disk space".
         require_exactly(workflow, "set -euo pipefail", 20)?;
         require_exactly(workflow, "assert_glibc_floor() {", 2)?;
@@ -789,7 +790,8 @@ mod dist_release_contract {
             "--certificate-github-workflow-repository \"$EXPECTED_REPOSITORY\"",
             "--certificate-github-workflow-ref \"refs/tags/${RELEASE_TAG}\"",
             "--certificate-github-workflow-sha \"$EXPECTED_REVISION\"",
-            "--certificate-github-workflow-trigger \"push\"",
+            // Fork (FORK.md): releases run by dispatch.
+            "--certificate-github-workflow-trigger \"workflow_dispatch\"",
             "unset SIGSTORE_ROOT_FILE SIGSTORE_REKOR_PUBLIC_KEY SIGSTORE_CT_LOG_PUBLIC_KEY_FILE",
             "expected_release_assets=(\"${signed_subjects[@]}\")",
             "expected_release_assets+=(\"${subject}.sigstore.json\")",
