@@ -531,8 +531,11 @@ jobs:
           Compress-Archive -Path "target/${{ matrix.target }}/release/mcp-agent-mail.exe","target/${{ matrix.target }}/release/am.exe" -DestinationPath "dist/$zipName"
           cd dist
           $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
+          # Fork (FORK.md): .NET resolves a relative path against the
+          # process directory, which `cd` doesn't move, so the sidecar
+          # needs an absolute path to land in dist.
           [System.IO.File]::WriteAllText(
-            "${zipName}.sha256",
+            (Join-Path $PWD.Path "${zipName}.sha256"),
             "$hash  $zipName`n",
             [System.Text.Encoding]::ASCII
           )

@@ -979,7 +979,7 @@ mod dist_release_contract {
             ),
             mutate(
                 &workflow,
-                "[System.IO.File]::WriteAllText(\n            \"${zipName}.sha256\",\n            \"$hash  $zipName`n\",\n            [System.Text.Encoding]::ASCII\n          )",
+                "[System.IO.File]::WriteAllText(\n            (Join-Path $PWD.Path \"${zipName}.sha256\"),\n            \"$hash  $zipName`n\",\n            [System.Text.Encoding]::ASCII\n          )",
                 "\"$hash  $zipName\" | Out-File -Encoding ASCII \"${zipName}.sha256\"",
             ),
             mutate(&workflow, CHECKOUT_ACTION, "actions/checkout@v4"),
