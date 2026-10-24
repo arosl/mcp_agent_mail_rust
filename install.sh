@@ -75,7 +75,7 @@ MINISIGN_BIN=""
 # and the SHA-256 of that release's SHA256SUMS manifest. ACFS pins this script
 # by its own SHA-256, so that pin covers the release binaries too. Without
 # --version, this script installs the pinned release.
-FORK_PINNED_VERSION='v0.3.39-herdr.4'
+FORK_PINNED_VERSION='v0.3.39-herdr.5'
 FORK_PINNED_SHA256SUMS_SHA256=''
 # "minisign" for releases >= MINISIGN_TRUST_MIN_VERSION, "sigstore" for older
 # releases, "pinned" for the fork's releases. Set by establish_release_contract.
