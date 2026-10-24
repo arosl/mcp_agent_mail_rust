@@ -76,7 +76,7 @@ MINISIGN_BIN=""
 # by its own SHA-256, so that pin covers the release binaries too. Without
 # --version, this script installs the pinned release.
 FORK_PINNED_VERSION='v0.3.39-herdr.6'
-FORK_PINNED_SHA256SUMS_SHA256=''
+FORK_PINNED_SHA256SUMS_SHA256='5b293abdae52527e2f831bfc799590135cd3aad559c8c6d60eb6b58b1398a6b9'
 # "minisign" for releases >= MINISIGN_TRUST_MIN_VERSION, "sigstore" for older
 # releases, "pinned" for the fork's releases. Set by establish_release_contract.
 RELEASE_TRUST_MODEL=""
